@@ -646,6 +646,15 @@ export ANTHROPIC_AUTH_TOKEN=<你设置的 api_key>
 | `auto_start` | `false` | 随应用启动自动拉起网关 |
 | `checkin_enabled` | `true` | 是否启用签到排程（猫猫旅行随之启停） |
 | `keepalive_enabled` | `true` | 是否启用 Token 保活排程 |
+| `activity_hours` | `[10]` | 活跃上报时点：点亮**连登天数**并解锁领养前置 |
+| `nightowl_hours` | `[1]` | 夜猫子任务时点（仅在 23:00–08:00 北京时间内计入） |
+| `school_hours` | `[12]` | 开学季活动时点（限时活动，只领已达标的奖励） |
+| `trial_hours` | `[9, 21]` | 国际版 trial 加油包领取时点（仅国际版账号） |
+| `activity_enabled` / `nightowl_enabled` / `school_enabled` / `trial_enabled` | `true` | 上述 4 个养号任务的启用开关 |
+| `activity_report_count` | `3` | 每号每日活跃上报条数（上限 20） |
+
+> 这 4 个养号任务在「设置 → 自动养号任务」中配置，每个任务都带「立即执行」按钮
+> 便于改完立刻验证（走网关的 `POST /tasks/run`）。**改完需要重启网关才生效**。
 
 转换成网关格式后写入 `gateway_native_config.json`，其中这些项需手动编辑：
 

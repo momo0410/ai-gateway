@@ -21,7 +21,28 @@ const (
 	buddyInfoPath      = "/activity/growth/buddy/info"
 	buddyFirstPath     = "/activity/growth/buddy/first"
 	buddyAgreementPath = "/activity/growth/buddy/agreement"
+	streakPath         = "/activity/growth/streak"
 )
+
+// GrowthStreak 回读连登天数。
+//
+// 用途是**上报自检**：活跃上报返回 200 不代表真的计分 —— 缺 userId 时服务端
+// 200 但静默丢弃，连登天数不动。回读是唯一能发现「静默失败」的手段。
+func (c *Client) GrowthStreak(a *auth.Auth) (int, error) {
+	data, err := c.growthJSON(a, http.MethodGet, streakPath, nil)
+	if err != nil {
+		return 0, err
+	}
+	var resp struct {
+		Streak struct {
+			Days int `json:"days"`
+		} `json:"streak"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return 0, err
+	}
+	return resp.Streak.Days, nil
+}
 
 // buddyTaskIncompleteMarker 领养门槛未达标的业务错误关键词（HTTP 400 时出现）。
 const buddyTaskIncompleteMarker = "first_buddy task not completed yet"
@@ -56,7 +77,7 @@ func (c *Client) growthJSON(a *auth.Auth, method, path string, body any) (json.R
 		return nil, err
 	}
 	BillingHeaders(req, a)
-	return c.doJSON(req)
+	return c.doJSON(a, req)
 }
 
 // TravelStatus 查询猫猫旅行状态。

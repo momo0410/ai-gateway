@@ -444,6 +444,20 @@ type Client struct {
 	// 与 HTTP 共享同一个 *http.Transport 实例，连接池不重复。
 	ChatHTTP *http.Client
 
+	// intlHTTP / intlChatHTTP 国际版账号专用 client（代理分流用），语义与
+	// HTTP/ChatHTTP 一一对应，只是多挂一个显式代理 transport。
+	//
+	// 为什么必须成对存在而不是「按需临时构造」：构造 client 要连带构造
+	// *http.Transport，而 transport 自带连接池 —— 每次请求新建一个等于池化失效
+	// （每个请求一次 TLS 握手），代理侧还会堆起大量短连接。
+	//
+	// 为空 = 未配显式代理（或尚未调 SetProxy）→ httpFor/chatClientFor 回落
+	// HTTP/ChatHTTP，即**改动前的行为**：每个请求都只挂 ProxyFromEnvironment。
+	// 即测试里直接字面量构造 &Client{HTTP: ...} 时本字段为 nil，国服与国际版
+	// 行为完全一致 —— 老测试的假上游因此不受本次分流影响。
+	intlHTTP     *http.Client
+	intlChatHTTP *http.Client
+
 	// HeaderTimeout 聊天 SSE 首字节前（响应头）超时；<=0 表示未设置（回落 HTTP.Timeout）。
 	HeaderTimeout time.Duration
 	// IdleTimeout 聊天 SSE 流中空闲超时；<=0 表示禁用空闲监控。
@@ -458,13 +472,35 @@ type Client struct {
 
 	ChatBaseCN    string
 	BillingBaseCN string
+	// WebBaseCN / WebBaseIntl 官网域（成长中心）基址。
+	//
+	// 为什么需要第三个基址：成长任务的**领奖**接口只在官网域提供
+	//（www.workbuddy.cn/activity/growth/tasks/<code>/claim），
+	// chat 域与 billing 域上都没有该路径（实测 CLI 域同形路径恒 400）。
+	// 任务列表与报名仍在 chat 域，因此三个基址并存、不可互相替代。
+	WebBaseCN   string
+	WebBaseIntl string
 	// BaseIntl 国际版基址。与国服不同，国际版所有端点（chat / billing /
 	// 签到 / 旅行 / token 刷新）都在同一域名下，因此只需一个 base。
 	BaseIntl string
 
 	// proxyURL 当前生效的显式代理（空串 = 未设置，回落环境变量）。
 	// 由 SetProxy 维护；国际版（workbuddy.ai）在国内直连不稳定，通常需要它。
+	//
+	// 作用范围见 scope：未显式指定时**仅国际版账号**（见 httpFor/chatClientFor）；
+	// 国服（*.workbuddy.cn / *.codebuddy.cn）在国内直连稳定，把它的流量绕进代理
+	// 既无收益，又平白多一跳、多一个故障面 —— 代理挂掉时国服账号会跟着一起
+	// 不可用（实测诉求来自所有者）。
 	proxyURL string
+
+	// scope 显式的适用范围（宿主配置 proxy_scope 的投影）；nil = 未显式指定。
+	//
+	// nil 与「两个都 false」**语义不同**，不能混为一谈：
+	//   - nil        → 老行为：国服走 ProxyFromEnvironment、国际版走显式代理；
+	//   - 非 nil     → 开关说了算（关 = 真直连，连环境变量代理也不用）。
+	// 用指针而不是值类型，正是为了保住这个三态；若用值类型，零值
+	// {false,false} 会让「没读过开关」与「两个都关」无法区分。
+	scope *ProxyScope
 }
 
 // IsIntl 判断账号是否属于国际版（供签到/旅行的区域范围过滤复用）。
@@ -486,14 +522,20 @@ func isIntl(a *auth.Auth) bool { return IsIntl(a) }
 func New() *Client {
 	// HTTP 与 ChatHTTP **共享同一个 Transport**：连接池不重复，
 	// 两者只差总时长（ChatHTTP.Timeout=0，首字节由 ResponseHeaderTimeout 约束）。
+	//
+	// 国际版那一对（intlHTTP/intlChatHTTP）此处**有意留空**：还没配代理，
+	// httpFor/chatClientFor 会回落这两个，国服与国际版行为完全一致 ——
+	// 与本次代理分流改动之前逐字相同。SetProxy 才会把国际版分出去。
 	tr := newTransport(nil)
 	return &Client{
 		HTTP:                 &http.Client{Timeout: 120 * time.Second, Transport: tr},
 		ChatHTTP:             &http.Client{Timeout: 0, Transport: tr},
 		SanitizeFingerprints: true,
 		ChatBaseCN:           "https://copilot.tencent.com",
-			BillingBaseCN:        "https://www.codebuddy.cn",
-			BaseIntl:             "https://www.workbuddy.ai",
+		BillingBaseCN:        "https://www.codebuddy.cn",
+		BaseIntl:             "https://www.workbuddy.ai",
+		WebBaseCN:            "https://www.workbuddy.cn",
+		WebBaseIntl:          "https://www.workbuddy.ai",
 	}
 }
 
@@ -505,14 +547,16 @@ func New() *Client {
 // workbuddy.ai 会超时（实测 wsarecv timeout），而浏览器因为读系统代理却正常。
 //
 // proxyURL 为 nil 时退回 ProxyFromEnvironment（仍尊重环境变量，行为与之前一致）。
+//
+// nil 分支是**未显式开关时的国服 transport**（见 applyProxy）：有意保留
+// ProxyFromEnvironment 而不是设成恒 nil（真正不走任何代理）。理由是它是本次改动
+// 之前所有出站请求的既有行为 —— 有用户靠 HTTPS_PROXY 做全局代理，擅自忽略等于
+// 替用户改网络配置，且现象隐蔽（只有国服请求突然超时）。
+//
+// 「真直连」用 newDirectTransport（Proxy 恒 nil），与 nil 分支**不是**同一件事，
+// 见其注释。
 func newTransport(proxyURL *url.URL) *http.Transport {
-	tr := &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 20,
-		IdleConnTimeout:     90 * time.Second,
-		// 聊天 SSE 首字节前硬上限（对短 RPC 无实际影响：其总时长 120s 更先到期）。
-		ResponseHeaderTimeout: 120 * time.Second,
-	}
+	tr := newTransportSkeleton()
 	if proxyURL != nil {
 		tr.Proxy = http.ProxyURL(proxyURL)
 	} else {
@@ -521,12 +565,115 @@ func newTransport(proxyURL *url.URL) *http.Transport {
 	return tr
 }
 
+// newDirectTransport 构造「真直连」transport：Proxy 恒为 nil。
+//
+// 这是用户**显式关闭**某个区域的代理开关后的语义：连环境变量里的
+// HTTP_PROXY / HTTPS_PROXY 也不使用。
+//
+// 为什么关掉就要连环境变量一起忽略，而不是「只不挂显式代理、留着
+// ProxyFromEnvironment」：开关的名字与文案都是「使用代理」，用户关掉它就是要
+// **不走代理**。若这时还偷偷吃 HTTPS_PROXY，用户会在界面上看到「已关闭」、
+// 实际流量仍绕道 —— 与「关了开关却仍在走代理」是同一种欺骗，而且更难查
+//（现象只在设了环境变量的机器上出现）。
+//
+// 代价与边界：这是本次唯一会让国服出站行为变化的路径，且**只发生在用户
+// 主动关掉国内版开关时**（配置里没有这个键的老用户仍走 ProxyFromEnvironment，
+// 见 applyProxy 的 scope==nil 分支）—— 不会因为升级而静默改变任何人的网络配置。
+func newDirectTransport() *http.Transport {
+	tr := newTransportSkeleton()
+	// 刻意不设 tr.Proxy：nil 表示「任何请求都不经代理」。
+	return tr
+}
+
+// newTransportSkeleton 三个 transport 共用的连接池调优参数。
+//
+// 抽出来是为了让 env / 显式代理 / 真直连三条路径**只差 Proxy 一个字段**：
+// 各写一份迟早会漂移（例如只给显式代理那套设了 ResponseHeaderTimeout），
+// 而漂移的表现是「某一路的聊天首字节超时按 120s 干等」，从日志上看不出来。
+func newTransportSkeleton() *http.Transport {
+	return &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 20,
+		IdleConnTimeout:     90 * time.Second,
+		// 聊天 SSE 首字节前硬上限（对短 RPC 无实际影响：其总时长 120s 更先到期）。
+		ResponseHeaderTimeout: 120 * time.Second,
+	}
+}
+
+// ProxyScope 显式的代理适用范围（三个独立开关里的**网关侧两个**）。
+//
+// 地址仍只填一次（宿主透传），本结构只决定「哪些区域使用它」。
+//
+// 为什么需要它：同一个代理对两个区域的收益完全相反 —— 国际版
+//（workbuddy.ai）国内直连实测 wsarecv 超时，必须走代理；国服
+//（copilot.tencent.com / codebuddy.cn）直连即通，绕进代理只会多一跳延迟、
+// 多一个故障面（代理一挂，本来好好的国服账号跟着不可用）。
+//
+// 零值（false/false）**不是**默认语义：默认由宿主写入，见 cmd/server/config.go
+// 的 Default()（cn=false / intl=true）。Go 侧刻意不在本类型上给默认值，
+// 避免「默认值」散落在两处而漂移。
+type ProxyScope struct {
+	// CN 国服账号的出站请求是否使用该显式代理。
+	CN bool
+	// Intl 国际版账号的出站请求是否使用该显式代理。
+	Intl bool
+}
+
 // SetProxy 设置出站代理（空串 = 不使用显式代理，回落环境变量）。
 //
-// 与 New() 一致：HTTP 与 ChatHTTP 共享**同一个** Transport（连接池不重复），
-// 两者只差总时长。既有连接不会被打断，由旧 Transport 自行回收；
-// 新请求立即走新代理。启动时调用一次即可。
+// 作用范围**仅国际版账号**：本函数一次性备好两套 transport/client，
+//   - 国际版（*.ai） → intlHTTP/intlChatHTTP，挂显式代理；
+//   - 国服           → HTTP/ChatHTTP，挂 ProxyFromEnvironment（= 既有默认行为）。
+//
+// 为什么按区域分流而不是给所有账号都挂代理：国际版 workbuddy.ai 在国内直连
+// 不稳定（实测 wsarecv 超时）才需要代理；国服 copilot.tencent.com /
+// codebuddy.cn 直连即通，把它的流量绕进代理只会（a）多一跳延迟、
+// （b）多一个故障面 —— 用户代理一挂，本来能正常用的国服账号一起不可用。
+//
+// 为什么不用「一个 transport + 按请求挑代理」的写法（比如在 Transport.Proxy
+// 里按 req.URL.Host 判断）：那样国服的**连接会与代理的连接共用同一个池**，
+// 一旦某次判定出错（或将来新增域名漏判），错的那一侧不会报错、只会静默绕道，
+// 从日志上看不出来。两套 transport 是物理隔离，判错的代价只是走错路而不会互相污染。
+//
+// 每套各自 HTTP/ChatHTTP 共享一个 Transport（连接池不重复），两者只差总时长。
+// 既有连接不会被打断，由旧 Transport 自行回收；新请求立即走新代理。
+// 启动时调用一次即可。
+//
+// **语义边界（重要）**：本函数表达的是「未显式选择适用范围」的老行为 ——
+// 国服回落 ProxyFromEnvironment。要按开关精确控制，在它之后调 SetProxyScope。
+// 这样拆分而不是直接改本函数的签名，是为了让既有调用点（含大量单测）语义不变：
+// 只有真的读到 proxy_scope 配置时，行为才由开关决定。
 func (c *Client) SetProxy(raw string) error {
+	return c.applyProxy(raw, nil)
+}
+
+// SetProxyScope 按**显式**的两个开关重新布置 transport（地址沿用已设的代理）。
+//
+// 语义（这是所有者确认过的口径，改之前请先读明白）：
+//
+//	开关开 → 该区域走**显式代理**（设置页里填的那个地址）
+//	开关关 → 该区域**真直连**：连环境变量里的 HTTP_PROXY / HTTPS_PROXY 也不用
+//
+// 「关 = 真直连」而不是「关 = 只不挂显式代理」，见 newDirectTransport 的注释。
+//
+// 必须在 SetProxy 之后调用（本函数不自带地址：地址由 SetProxy 解析并规范化，
+// 两处各解析一遍迟早会在「host:port 自动补 http://」这类容错上分叉）。
+// 未配代理（地址为空）时本函数是 no-op —— 没有地址可挂，开关也就无意义。
+func (c *Client) SetProxyScope(cn, intl bool) error {
+	if strings.TrimSpace(c.proxyURL) == "" {
+		// 无地址：什么都不做（保持 SetProxy("") 之后的既有状态）。
+		// 不能在这里建「真直连」transport 来"落实"两个 false —— 那会让一个
+		// 根本没填代理的用户，仅因为开关默认关就把国服从环境变量代理改成直连。
+		return nil
+	}
+	return c.applyProxy(c.proxyURL, &ProxyScope{CN: cn, Intl: intl})
+}
+
+// applyProxy SetProxy / SetProxyScope 的共同实现。
+//
+// scope == nil 表示「未显式指定适用范围」= 老行为：国服走 ProxyFromEnvironment、
+// 国际版走显式代理。scope != nil 时按两个开关精确布置（关 = 真直连）。
+func (c *Client) applyProxy(raw string, scope *ProxyScope) error {
 	raw = strings.TrimSpace(raw)
 	var proxyURL *url.URL
 	if raw != "" {
@@ -545,21 +692,129 @@ func (c *Client) SetProxy(raw string) error {
 		}
 		proxyURL = u
 	}
-	tr := newTransport(proxyURL)
+
+	// 每个区域需要**哪一类** transport：
+	//
+	//	trSpecEnv      ProxyFromEnvironment —— 未显式开关时的既有行为
+	//	trSpecExplicit 用户填的显式代理
+	//	trSpecDirect   真直连（Proxy=nil，连环境变量代理也不用）
+	//
+	// 先定「类别」再建实例，而不是先建几个实例再挑：类别是语义，实例是资源。
+	// 混在一起写会让「两个区域都开」这种组合不小心落到同一个实例上（见下方
+	// 关于区域隔离的注释）。未配显式代理时 trSpecExplicit 无处可建，此时
+	// 选它的区域回落 trSpecEnv（= 改动前「没填地址就只跟环境变量走」的行为）。
+	cnSpec, intlSpec := trSpecEnv, trSpecEnv
+	if scope == nil {
+		// 老行为：国服 env、国际版显式代理（有地址时）。
+		if proxyURL != nil {
+			intlSpec = trSpecExplicit
+		}
+	} else {
+		pickSpec := func(enabled bool) transportSpec {
+			if enabled {
+				if proxyURL != nil {
+					return trSpecExplicit
+				}
+				return trSpecEnv
+			}
+			return trSpecDirect
+		}
+		cnSpec, intlSpec = pickSpec(scope.CN), pickSpec(scope.Intl)
+	}
+
+	// 未配地址时两个区域的行为必然相同（都只跟环境变量走），此时**共用**一个
+	// transport 并把国际版那一对归空 —— 这是 New()/SetProxy("") 之后的既有状态，
+	// 有既有断言依赖它（未配代理时 intlHTTP 必须为 nil）。
+	//
+	// 反之，只要配了地址就**每个区域各建一个实例**（哪怕两格的类别相同，例如都开
+	// → 都是显式代理）。理由：区域隔离是上一轮分流的硬要求 —— 共用连接池会让
+	// 「关掉其中一路」之后旧连接仍可能被另一路复用，而那种污染在日志里看不出来。
+	// 代价只是一个额外的空连接池（不建连接就不占资源）。
+	shareTransports := proxyURL == nil && cnSpec == intlSpec
+
+	// 本次新建的 transport 全部记下来，稍后统一套用继承来的调优值。
+	var built []*http.Transport
+	newOf := func(spec transportSpec) *http.Transport {
+		var tr *http.Transport
+		if spec == trSpecExplicit {
+			tr = newTransport(proxyURL)
+		} else if spec == trSpecDirect {
+			tr = newDirectTransport()
+		} else {
+			tr = newTransport(nil)
+		}
+		built = append(built, tr)
+		return tr
+	}
+	cnTr := newOf(cnSpec)
+	intlTr := cnTr
+	if !shareTransports {
+		intlTr = newOf(intlSpec)
+	}
+
 	// 保留调用方已设的调优值（SetProxy 常在 New 之后、调优之前调用，
 	// 但测试/其它调用顺序不确定，故这里从旧 Transport 继承可继承的字段）。
-	if old, ok := c.ChatHTTP.Transport.(*http.Transport); ok && old != nil {
-		tr.ResponseHeaderTimeout = old.ResponseHeaderTimeout
+	//
+	// ChatHTTP/HTTP 都可能为 nil：测试里字面量构造 &Client{HTTP: ...} 很常见，
+	// 直接取 .Transport 会空指针 panic（现象是「配了代理网关直接崩」）。
+	headerTimeout := 120 * time.Second
+	if c.ChatHTTP != nil {
+		if old, ok := c.ChatHTTP.Transport.(*http.Transport); ok && old != nil {
+			headerTimeout = old.ResponseHeaderTimeout
+		}
 	}
-	c.HTTP = &http.Client{Timeout: 120 * time.Second, Transport: tr}
-	c.ChatHTTP = &http.Client{Timeout: 0, Transport: tr}
+	// 短 RPC 总时长同样继承（main.go 是按 client 设的 up.HTTP.Timeout，
+	// 若 SetProxy 在调优之后被调用，不继承会把上限悄悄退回 120s）。
+	rpcTimeout := 120 * time.Second
+	if c.HTTP != nil && c.HTTP.Timeout > 0 {
+		rpcTimeout = c.HTTP.Timeout
+	}
+	// 本次新建的 transport 全部套用继承来的值：漏掉某一个会让那一路悄悄退回
+	// 默认（表现为「开了开关的那一路按新上限超时，另一路仍干等 120s」，
+	// 两边日志长得一样，从现象上几乎发现不了）。
+	for _, tr := range built {
+		tr.ResponseHeaderTimeout = headerTimeout
+	}
+
+	c.HTTP = &http.Client{Timeout: rpcTimeout, Transport: cnTr}
+	c.ChatHTTP = &http.Client{Timeout: 0, Transport: cnTr}
+	// 国际版与国服用**同一个** transport 时把 intl 那一对归空，让
+	// httpFor/chatClientFor 回落 HTTP/ChatHTTP：两套 client 指向同一个 transport
+	// 除了多一层间接没有区别，而归空能保住既有断言「未配代理时 intlHTTP 为 nil」。
+	if intlTr == cnTr {
+		c.intlHTTP, c.intlChatHTTP = nil, nil
+	} else {
+		c.intlHTTP = &http.Client{Timeout: rpcTimeout, Transport: intlTr}
+		c.intlChatHTTP = &http.Client{Timeout: 0, Transport: intlTr}
+	}
 	c.proxyURL = raw
+	c.scope = scope
 	return nil
 }
+
+// transportSpec 一个区域需要的 transport **类别**（不是实例）。
+type transportSpec int
+
+const (
+	// trSpecEnv 回落 ProxyFromEnvironment（尊重 HTTPS_PROXY 等环境变量）。
+	trSpecEnv transportSpec = iota
+	// trSpecExplicit 走用户在设置页里填的那个显式代理。
+	trSpecExplicit
+	// trSpecDirect 真直连：Proxy 为 nil，连环境变量代理也不用。
+	trSpecDirect
+)
 
 // ProxyURL 返回当前生效的显式代理（空串 = 未设置）。
 func (c *Client) ProxyURL() string {
 	return c.proxyURL
+}
+
+// ProxyScope 返回当前生效的显式适用范围；nil 表示未显式指定（= 老行为）。
+//
+// 供 main.go 打印**如实的**启动日志：说成「所有出站请求经 X」会让用户以为
+// 国服流量也在绕道，从而误判国服变慢的原因。
+func (c *Client) ProxyScope() *ProxyScope {
+	return c.scope
 }
 
 // chatHTTP 返回聊天专用 client；未设置（如测试只注入 HTTP）时回落 HTTP。
@@ -568,6 +823,69 @@ func (c *Client) chatHTTP() *http.Client {
 		return c.ChatHTTP
 	}
 	return c.HTTP
+}
+
+// httpFor 返回该账号出站**短 RPC** 应使用的 client（按区域选 transport）。
+//
+// 国际版 → 挂显式代理的 intlHTTP；国服 → HTTP（ProxyFromEnvironment）。
+// 未配显式代理时 intlHTTP 为 nil，两者都回落 HTTP —— 行为与改动前一致。
+func (c *Client) httpFor(a *auth.Auth) *http.Client {
+	if isIntl(a) && c.intlHTTP != nil {
+		return c.intlHTTP
+	}
+	if c.HTTP != nil {
+		return c.HTTP
+	}
+	return http.DefaultClient
+}
+
+// chatClientFor 返回该账号**聊天 SSE** 应使用的 client；语义与 httpFor 相同，
+// 只差总时长（ChatHTTP 无总时长，靠 ResponseHeaderTimeout 兜底）。
+func (c *Client) chatClientFor(a *auth.Auth) *http.Client {
+	if isIntl(a) && c.intlChatHTTP != nil {
+		return c.intlChatHTTP
+	}
+	return c.chatHTTP()
+}
+
+// ApplyResponseHeaderTimeout 把聊天 SSE 首字节上限应用到**所有** transport。
+//
+// 为什么要有这个方法而不是让调用方自己类型断言：SetProxy 之后 transport 有
+// 两个（国服直连 + 国际版代理），调用方只拿到 c.ChatHTTP.Transport 时，
+// 国际版那一个会被漏掉 —— 表现为「国服按新上限超时，国际版仍按 120s 干等」，
+// 而日志里两边长得一样，极难发现。把遍历收在这里，新增 transport 时只需改一处。
+//
+// 参数 <=0 表示未设置（保持 null 语义，不做任何改动）。
+func (c *Client) ApplyResponseHeaderTimeout(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	for _, cl := range []*http.Client{c.HTTP, c.ChatHTTP, c.intlHTTP, c.intlChatHTTP} {
+		if cl == nil {
+			continue
+		}
+		if tr, ok := cl.Transport.(*http.Transport); ok && tr != nil {
+			tr.ResponseHeaderTimeout = d
+		}
+	}
+}
+
+// SetRPCTimeout 把短 RPC（refresh/checkin/balance/FetchModels）总时长上限
+// 应用到**所有**短 RPC client（国服直连 + 国际版代理）。
+//
+// 与 ApplyResponseHeaderTimeout 同理：只设 c.HTTP 会让国际版短 RPC 悄悄退回
+// 硬编码 120s，与配置不符。ChatHTTP 不动 —— 它的语义就是无总时长
+// （Timeout=0），改它等于把长对话截断。
+func (c *Client) SetRPCTimeout(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	if c.HTTP != nil {
+		c.HTTP.Timeout = d
+	}
+	if c.intlHTTP != nil {
+		c.intlHTTP.Timeout = d
+	}
 }
 
 // chatBase 返回该账号的 chat 基址（按区域路由）。
@@ -616,9 +934,33 @@ func (c *Client) billingBase(a *auth.Auth) string {
 	return c.BillingBaseCN
 }
 
+// webBase 返回该账号的官网（成长中心）基址。
+//
+// 国服与国际版都是各自站点的主域：国服 www.workbuddy.cn、国际版 www.workbuddy.ai。
+// 与 billingBase 的区别在于 billing 在国服走 codebuddy.cn（计费后台），
+// 而成长中心是面向用户的 Web 站点 —— 两者不可互相替代。
+func (c *Client) webBase(a *auth.Auth) string {
+	if isIntl(a) {
+		if c.WebBaseIntl != "" {
+			return c.WebBaseIntl
+		}
+		return "https://www.workbuddy.ai"
+	}
+	if c.WebBaseCN != "" {
+		return c.WebBaseCN
+	}
+	return "https://www.workbuddy.cn"
+}
+
 // doJSON 发请求并解信封；HTTP 非 2xx 或业务 code != 0 时返回带 body 片段的 *Error。
-func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
-	resp, err := c.HTTP.Do(req)
+//
+// a 用来决定走哪套 transport（国际版经代理、国服直连，见 httpFor）。
+// 由 req 的 Host 反推区域是**不行的**：BaseIntl / WebBaseIntl / ChatBaseCN 都是
+// 可注入字段（测试全部指向 httptest 的 127.0.0.1），从 Host 看不出区域；
+// 而区域的真值只有 Auth.Domain 一个来源（auth.Auth.IsIntl）。
+// a 允许为 nil（少数内部调用不需要账号），此时按国服处理 = 直连。
+func (c *Client) doJSON(a *auth.Auth, req *http.Request) (json.RawMessage, error) {
+	resp, err := c.httpFor(a).Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -656,7 +998,7 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 		return err
 	}
 	RefreshHeaders(req, a)
-	data, err := c.doJSON(req)
+	data, err := c.doJSON(a, req)
 	if err != nil {
 		return err
 	}
@@ -695,7 +1037,7 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 	ChatHeaders(req, a)
 	ctx, cancel := context.WithCancel(context.Background())
 	req = req.WithContext(ctx)
-	resp, err := c.chatHTTP().Do(req)
+	resp, err := c.chatClientFor(a).Do(req)
 	if err != nil {
 		cancel()
 		log.Printf("chat_stream uid=%s: transport error: %v", a.UID, err)
@@ -803,7 +1145,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	req.Header.Set("Origin", origin)
 	req.Header.Set("Referer", origin+"/")
 	req.Header.Set("User-Agent", modelsConfigUA)
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.httpFor(a).Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -1057,7 +1399,7 @@ func (c *Client) UserResourceDetail(a *auth.Auth) (CreditInfo, error) {
 		return CreditInfo{}, err
 	}
 	BillingHeaders(req, a)
-	data, err := c.doJSON(req)
+	data, err := c.doJSON(a, req)
 	if err != nil {
 		return CreditInfo{}, err
 	}
@@ -1094,7 +1436,7 @@ func (c *Client) DailyCheckin(a *auth.Auth) error {
 		return err
 	}
 	BillingHeaders(req, a)
-	_, err = c.doJSON(req)
+	_, err = c.doJSON(a, req)
 	return err
 }
 

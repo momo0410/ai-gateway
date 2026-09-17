@@ -45,7 +45,8 @@ func TestNextFireMergesSchedules(t *testing.T) {
 
 // TestNextWakeKeepaliveOnly 签到已过点时按保活整点唤醒。
 func TestNextWakeKeepaliveOnly(t *testing.T) {
-	s := New(Config{CheckinHours: []int{9}, KeepaliveHours: []int{22}})
+	s := New(Config{CheckinHours: []int{9}, KeepaliveHours: []int{22},
+		ActivityDisabled: true, NightOwlDisabled: true, SchoolDisabled: true, TrialDisabled: true})
 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 20, 0, 0, 0, time.Local))
 	if want := time.Date(2026, 9, 11, 22, 0, 0, 0, time.Local); !at.Equal(want) {
 		t.Errorf("next=%v want %v", at, want)
@@ -57,7 +58,15 @@ func TestNextWakeKeepaliveOnly(t *testing.T) {
 
 // TestNextWakeSameInstantFiresAll 签到与保活配到同一整点时两类任务都要执行。
 func TestNextWakeSameInstantFiresAll(t *testing.T) {
-	s := New(Config{CheckinHours: []int{9, 22}, KeepaliveHours: []int{22}})
+	// 关掉与本次断言无关的任务，避免它们抢占最近时点。
+	s := New(Config{
+		CheckinHours:     []int{9, 22},
+		KeepaliveHours:   []int{22},
+		ActivityDisabled: true,
+		NightOwlDisabled: true,
+		SchoolDisabled: true,
+		TrialDisabled: true,
+	})
 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 21, 30, 0, 0, time.Local))
 	if want := time.Date(2026, 9, 11, 22, 0, 0, 0, time.Local); !at.Equal(want) {
 		t.Errorf("next=%v want %v", at, want)
@@ -87,7 +96,8 @@ func TestNextWakeNothingScheduled(t *testing.T) {
 
 // TestNextWakeCheckinDisabled 显式禁用签到后，排程里不再有签到时点（保活照常）。
 func TestNextWakeCheckinDisabled(t *testing.T) {
-	s := New(Config{CheckinDisabled: true, CheckinHours: []int{9, 21}, KeepaliveHours: []int{22}})
+	s := New(Config{CheckinDisabled: true, CheckinHours: []int{9, 21}, KeepaliveHours: []int{22},
+		ActivityDisabled: true, NightOwlDisabled: true, SchoolDisabled: true, TrialDisabled: true})
 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 20, 0, 0, 0, time.Local))
 	if want := time.Date(2026, 9, 11, 22, 0, 0, 0, time.Local); !at.Equal(want) {
 		t.Errorf("next=%v want %v（不应再有 21 点签到）", at, want)
@@ -99,7 +109,8 @@ func TestNextWakeCheckinDisabled(t *testing.T) {
 
 // TestNextWakeKeepaliveDisabled 显式禁用保活后，排程里不再有保活时点（签到照常）。
 func TestNextWakeKeepaliveDisabled(t *testing.T) {
-	s := New(Config{KeepaliveDisabled: true, CheckinHours: []int{9, 21}, KeepaliveHours: []int{22}})
+	s := New(Config{KeepaliveDisabled: true, CheckinHours: []int{9, 21}, KeepaliveHours: []int{22},
+		ActivityDisabled: true, NightOwlDisabled: true, SchoolDisabled: true, TrialDisabled: true})
 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 20, 0, 0, 0, time.Local))
 	if want := time.Date(2026, 9, 11, 21, 0, 0, 0, time.Local); !at.Equal(want) {
 		t.Errorf("next=%v want %v（不应再有 22 点保活）", at, want)
@@ -114,8 +125,14 @@ func TestNextWakeBothDisabledNothingScheduled(t *testing.T) {
 	s := New(Config{
 		CheckinDisabled:   true,
 		KeepaliveDisabled: true,
+		ActivityDisabled:  true,
+		NightOwlDisabled:  true,
+		SchoolDisabled:  true,
+		TrialDisabled:  true,
 		CheckinHours:      []int{9, 21},
 		KeepaliveHours:    []int{22},
+		ActivityHours:     []int{10},
+		NightOwlHours:     []int{1},
 	})
 	at, kinds := s.nextWake(time.Now())
 	if !at.IsZero() || len(kinds) != 0 {
@@ -261,10 +278,16 @@ func TestRunKeepaliveRefreshesTokens(t *testing.T) {
 	}
 }
 
-func TestRunKeepaliveSessionDeadDisables(t *testing.T) {
+// TestRunKeepaliveSessionDeadNeedsConsecutiveFails session 失效需**连续**达阈值才禁用。
+//
+// 本用例原为 TestRunKeepaliveSessionDeadDisables，断言「一次 12153 即禁用」。
+// 该行为已认定为缺陷：12153 会被网络抖动/上游闪断临时触发，一次即永久杀号
+// 会误杀健康账号（实测发现一批 disabled 账号其实 refresh 完全正常）。
+// 现改为连续 pool.SessionDeadThreshold() 次才禁用，前 N-1 次只计数。
+func TestRunKeepaliveSessionDeadNeedsConsecutiveFails(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(401)
-		w.Write([]byte(`{"code":12153,"msg":"Offline user session not found"}`))
+		_, _ = w.Write([]byte(`{"code":12153,"msg":"Offline user session not found"}`))
 	}))
 	defer srv.Close()
 
@@ -278,10 +301,89 @@ func TestRunKeepaliveSessionDeadDisables(t *testing.T) {
 		BillingBaseCN: srv.URL,
 	}
 	s := New(Config{Pool: p, Upstream: up})
+
+	threshold := pool.SessionDeadThreshold()
+	if threshold < 2 {
+		t.Fatalf("阈值应 >=2 才有「连续」语义，实际 %d", threshold)
+	}
+
+	// 前 threshold-1 次：只计数，不禁用
+	for i := 1; i < threshold; i++ {
+		s.RunKeepaliveNow()
+		st, _ := p.Status("u1")
+		if st.Disabled {
+			t.Fatalf("第 %d 次 12153 不应禁用（阈值 %d，偶发失败不该杀号）: %+v",
+				i, threshold, st)
+		}
+		if got := p.SessionDeadFails("u1"); got != i {
+			t.Errorf("第 %d 次后计数应为 %d，实际 %d", i, i, got)
+		}
+	}
+
+	// 第 threshold 次：达阈值，禁用
 	s.RunKeepaliveNow()
 	st, _ := p.Status("u1")
 	if !st.Disabled {
-		t.Errorf("should disable session-dead account: %+v", st)
+		t.Errorf("连续 %d 次 12153 后应禁用: %+v", threshold, st)
+	}
+	if got := p.SessionDeadFails("u1"); got != 0 {
+		t.Errorf("禁用后计数应清零，实际 %d", got)
+	}
+}
+
+// TestRunKeepaliveSuccessClearsSessionDead refresh 成功要清零连续计数（复活路径）。
+func TestRunKeepaliveSuccessClearsSessionDead(t *testing.T) {
+	var fail atomic.Bool
+	fail.Store(true)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if fail.Load() {
+			w.WriteHeader(401)
+			_, _ = w.Write([]byte(`{"code":12153,"msg":"Offline user session not found"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"data":{"accessToken":"new","refreshToken":"rt2","expiresIn":3600}}`))
+	}))
+	defer srv.Close()
+
+	p := pool.New("")
+	a := &auth.Auth{UID: "u1", AccessToken: "old", RefreshToken: "rt", ExpiresAt: 1}
+	p.Add(a)
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(Config{Pool: p, Upstream: up})
+
+	// 先累计 threshold-1 次失败（未达禁用阈值）
+	for i := 1; i < pool.SessionDeadThreshold(); i++ {
+		s.RunKeepaliveNow()
+	}
+	if got := p.SessionDeadFails("u1"); got == 0 {
+		t.Fatal("前置条件：应有未清零的计数")
+	}
+
+	// 转为成功 → 计数清零，账号不被禁用
+	fail.Store(false)
+	s.RunKeepaliveNow()
+	if got := p.SessionDeadFails("u1"); got != 0 {
+		t.Errorf("refresh 成功后计数应清零，实际 %d", got)
+	}
+	st, _ := p.Status("u1")
+	if st.Disabled {
+		t.Error("refresh 成功的账号不应被禁用")
+	}
+}
+
+// TestNoteSuccessClearsSessionDead chat 成功同样清零计数（误判防护的复活路径）。
+func TestNoteSuccessClearsSessionDead(t *testing.T) {
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "tok"})
+
+	p.NoteSessionDead("u1")
+	if p.SessionDeadFails("u1") == 0 {
+		t.Fatal("前置条件：计数应已累计")
+	}
+	p.NoteSuccess("u1")
+	if got := p.SessionDeadFails("u1"); got != 0 {
+		t.Errorf("chat 成功后应清零连续 12153 计数，实际 %d", got)
 	}
 }
 

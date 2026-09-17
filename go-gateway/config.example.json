@@ -9,8 +9,17 @@
   "schedule": {
     "checkin_hours": [9, 21],
     "keepalive_hours": [22],
+    "activity_hours": [10],
+    "nightowl_hours": [1],
+    "school_hours": [12],
+    "trial_hours": [9, 21],
     "checkin_enabled": true,
-    "keepalive_enabled": true
+    "keepalive_enabled": true,
+    "activity_enabled": true,
+    "nightowl_enabled": true,
+    "school_enabled": true,
+    "trial_enabled": true,
+    "activity_report_count": 3
   },
   "upstream": {
     "timeout_seconds": 120,
@@ -19,6 +28,10 @@
   },
   "features": {
     "sanitize_blacklist_fingerprints": true
+  },
+  "prompt": {
+    "mode": "passthrough",
+    "file": ""
   },
   "upstash": {
     "url": "",
@@ -36,5 +49,10 @@
     "enabled": true,
     "ttl": "30m",
     "gc_interval": "5m"
+  },
+  "account_records": {
+    "file": "",
+    "retention_days": 60,
+    "identities": []
   }
 }

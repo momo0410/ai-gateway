@@ -30,7 +30,11 @@ import type {
   GatewayStartResult,
   GatewayStatus,
   GatewayPortCheck,
+  GatewayPortHolder,
   GatewaySyncResult,
+  GatewayTaskName,
+  GrowthTaskResult,
+  GatewayTaskRunResult,
   GatewayUsageResult,
   GithubConfig,
   ImportPreviewAccount,
@@ -104,6 +108,7 @@ const ROUTES: Record<string, Route> = {
   detect_codebuddy_cn_ide_account: { method: "POST", path: "/api/codebuddy-cn-ide/detect" },
   delete_account: { method: "POST", path: "/api/delete" },
   set_account_note: { method: "POST", path: "/api/accounts/note" },
+  set_account_disabled: { method: "POST", path: "/api/accounts/disabled" },
   oauth_start: { method: "POST", path: "/api/oauth/start" },
   oauth_status: { method: "POST", path: "/api/oauth/status" },
   import_local: { method: "POST", path: "/api/import-local" },
@@ -125,6 +130,11 @@ const ROUTES: Record<string, Route> = {
   get_auto_checkin_config: { method: "GET", path: "/api/checkin/config" },
   save_auto_checkin_config: { method: "POST", path: "/api/checkin/config" },
   get_checkin_logs: { method: "GET", path: "/api/checkin/logs" },
+  // 记录保留设置：Tauri 命令与 HTTP 路由同名映射，webui 模式下同样可用
+  get_record_retention: { method: "GET", path: "/api/settings/retention" },
+  save_record_retention: { method: "POST", path: "/api/settings/retention" },
+  get_account_records: { method: "POST", path: "/api/account-records" },
+  backfill_account_records: { method: "POST", path: "/api/account-records/backfill" },
   get_travel_status: { method: "GET", path: "/api/travel/status" },
   travel_run: { method: "POST", path: "/api/travel/run" },
   travel_adopt: { method: "POST", path: "/api/travel/adopt" },
@@ -145,14 +155,21 @@ const ROUTES: Record<string, Route> = {
   get_gateway_config: { method: "GET", path: "/api/gateway/config" },
   save_gateway_config: { method: "POST", path: "/api/gateway/config" },
   switch_gateway_mode: { method: "POST", path: "/api/gateway/mode" },
+  // 「限制使用的模型」：多值（新界面）与单值（旧界面）共用同一个路由，
+  // 后端按 body 里的键名区分（models/allowedModels vs model/allowedModel）。
+  set_allowed_models: { method: "POST", path: "/api/gateway/allowed-model" },
   set_allowed_model: { method: "POST", path: "/api/gateway/allowed-model" },
   start_gateway: { method: "POST", path: "/api/gateway/start" },
   check_gateway_port: { method: "POST", path: "/api/gateway/port-check" },
+  kill_gateway_port_holder: { method: "POST", path: "/api/gateway/port-kill" },
+  get_gateway_port_holder: { method: "POST", path: "/api/gateway/port-holder" },
   stop_gateway: { method: "POST", path: "/api/gateway/stop" },
   restart_gateway: { method: "POST", path: "/api/gateway/restart" },
   sync_gateway_accounts: { method: "POST", path: "/api/gateway/sync" },
   get_gateway_models: { method: "GET", path: "/api/gateway/models" },
   get_gateway_usage: { method: "GET", path: "/api/gateway/usage" },
+  run_gateway_task: { method: "POST", path: "/api/gateway/task-run" },
+  run_growth_task: { method: "POST", path: "/api/gateway/growth-task" },
   // ---- 一键导入：接入本机 AI 客户端 ----
   detect_agent_clients: { method: "GET", path: "/api/gateway/agents" },
   import_agent_client: { method: "POST", path: "/api/gateway/agents/import" },
@@ -553,18 +570,120 @@ export function getCheckinLogs(): Promise<{ logs: CheckinLog[] }> {
   return call("get_checkin_logs");
 }
 
+/** 记录保留天数设置（签到日志 / 积分快照 / 任务记录共用同一口径）。 */
+export interface RecordRetentionSetting {
+  days: number;
+  defaultDays: number;
+  minDays: number;
+  maxDays: number;
+  presets: { days: number; label: string }[];
+}
+
+export function getRecordRetention(): Promise<RecordRetentionSetting> {
+  return call("get_record_retention");
+}
+
+/** 保存保留天数；返回归一化后的实际生效值（越界值会被夹到合法区间）。 */
+export function saveRecordRetention(days: number): Promise<{ days: number }> {
+  return call("save_record_retention", { days });
+}
+
+// ---------------------------------------------------------------------------
+// 账号记录（任务 / 积分 / Token 三类事件的统一流水）
+// ---------------------------------------------------------------------------
+
+/** 一条账号记录。 */
+export interface AccountRecordItem {
+  ts: number;
+  accountId: string;
+  accountName: string;
+  /** task | credit | token */
+  kind: string;
+  title: string;
+  /** success | failed | already | info */
+  result: string;
+  /** 积分增减或 Token 数量；无则为 0 */
+  amount: number;
+  detail: string;
+  /**
+   * 积分变化的来源：grant（额度发放）| consume（调用扣减）| expire（额度到期）| adjust。
+   *
+   * **可选**是刻意的，不是疏漏：这个字段是后加的，历史记录里根本没有它。
+   * 后端对老记录不会补写（记录是只追加的事件流，不改写历史），
+   * 所以运行时完全可能是 undefined —— 声明成必填只会把 undefined 藏进类型里，
+   * 让渲染处忘记兜底。消费方必须自己判空。
+   */
+  source?: string;
+}
+
+export interface AccountRecordsResult {
+  records: AccountRecordItem[];
+  /** 过滤后的总条数（不受 limit 影响） */
+  total: number;
+  summary: {
+    taskCount: number;
+    creditNet: number;
+    tokenSum: number;
+  };
+  retentionDays: number;
+}
+
+/** 查询账号记录；accountId 为空表示全部账号。 */
+export function getAccountRecords(params: {
+  accountId?: string;
+  from?: number;
+  to?: number;
+  kinds?: string[];
+  limit?: number;
+}): Promise<AccountRecordsResult> {
+  return call("get_account_records", {
+    accountId: params.accountId ?? null,
+    from: params.from ?? null,
+    to: params.to ?? null,
+    kinds: params.kinds ?? null,
+    limit: params.limit ?? 500,
+  });
+}
+
+/** 把历史签到日志回填为账号记录（幂等，重复调用不产生重复）。 */
+export function backfillAccountRecords(): Promise<{ added: number }> {
+  return call("backfill_account_records");
+}
+
 export async function getTravelStatus(accountId: string): Promise<TravelStatus> {
   if (demoModeEnabled) {
     return screenshotDemoResponse("get_travel_status", { accountId }) as TravelStatus;
   }
   if (isWebui()) {
-    // webui 端为批量接口，按 accountId 过滤
+    // webui 端为批量接口，按 accountId 过滤。
+    //
+    // message / skip 必须一并带出：后端 `travel_display` 会把「无 Buddy（领养需先
+    // 积累对话轮次）」这类**具体原因**放在 message 里（travel.rs::display_record），
+    // 而这里原先只映射 4 个字段，把原因丢掉了 —— 卡片菜单因此只能靠 label 反推，
+    // 可 label 描述的是**旅行**状态、不是**领养**状态（详见 account-card 里
+    // buddyKnowledge 的说明）。少透出这两个字段，界面就只能猜。
     const all = await httpCall<{
-      accounts: { accountId: string; email: string; label: TravelStatus["label"]; rewardCredit: number | null; locationName?: string | null; arriveAt?: number | null }[];
+      accounts: {
+        accountId: string;
+        email: string;
+        label: TravelStatus["label"];
+        rewardCredit: number | null;
+        locationName?: string | null;
+        arriveAt?: number | null;
+        message?: string | null;
+        skip?: string | null;
+      }[];
     }>("get_travel_status");
     const one = all.accounts.find((a) => a.accountId === accountId);
     return one
-      ? { label: one.label, rewardCredit: one.rewardCredit, locationName: one.locationName ?? null, arriveAt: one.arriveAt ?? null }
+      ? {
+          label: one.label,
+          rewardCredit: one.rewardCredit,
+          locationName: one.locationName ?? null,
+          arriveAt: one.arriveAt ?? null,
+          message: one.message ?? null,
+          skip: one.skip ?? null,
+        }
       : { label: "untraveled", rewardCredit: null, locationName: null, arriveAt: null };
   }
   return call("get_travel_status", { accountId });
@@ -614,10 +733,25 @@ export function getGithubConfig(): Promise<GithubConfig> {
   return call("get_github_config");
 }
 
-export function saveGithubConfig(config: GithubConfig): Promise<GithubConfig> {
-  return call("save_github_config", {
+/**
+ * 保存更新源配置（含代理地址与 proxy_scope 三个开关）。
+ *
+ * **两个通道的返回形状不同，必须在这里抹平**：
+ *   - Tauri command 直接返回配置对象（commands.rs::save_github_config）；
+ *   - webui 的 HTTP 路由返回 `{ ok: true, config: {...} }`（api.rs::api_save_update_config）。
+ *
+ * 不抹平的后果不是「报错」而是「静默清空」：调用方写的是 `saved.proxy`，
+ * 在 webui 下读出 undefined → 输入框被清空、三个开关被拨回默认值，而用户
+ * 明明刚点了保存。本函数此前没做这层适配，webui（浏览器打开宿主页面）下
+ * 保存代理一直是坏的，只是没有用例覆盖到。
+ */
+export async function saveGithubConfig(config: GithubConfig): Promise<GithubConfig> {
+  const res = await call<GithubConfig & { config?: GithubConfig }>("save_github_config", {
     config: config as unknown as Record<string, unknown>,
   });
+  // 只认「带 config 包装层」这一种形态：Tauri 返回的配置对象里没有 config 键
+  //（它只有 owner/repo/proxy/proxy_scope），所以这个判断不会误伤。
+  return res && typeof res === "object" && res.config ? res.config : res;
 }
 
 export function checkUpdate(proxy?: string, force?: boolean): Promise<UpdateInfo> {
@@ -668,6 +802,37 @@ export function getGatewayConfig(): Promise<GatewayConfigResult> {
 }
 
 /**
+ * 手动触发一轮养号任务（活跃上报 / 夜猫子 / 开学季 / trial）。
+ *
+ * 这 4 个任务的实现在 Go 网关里，本函数只是把请求转过去。
+ * 注意返回 `ran=false` + `skip` 是**正常结果**（如夜猫子不在 23:00–08:00 窗口内），
+ * 调用方应当作说明展示而非报错。
+ */
+export function runGatewayTask(task: GatewayTaskName): Promise<GatewayTaskRunResult> {
+  return call<GatewayTaskRunResult>("run_gateway_task", { task });
+}
+
+/**
+ * 成长任务「一键完成」。
+ *
+ * `action`：
+ *   - `list`：列出该账号的成长任务（只读、秒级）
+ *   - `run`：执行该账号的任务；`taskCode` 省略 = 跑全部待办
+ *   - `run-all`：所有账号跑一轮
+ *
+ * **耗时差异极大**：`list` 秒级；`run` 单账号分钟级（可能含**真实对话**，
+ * 会消耗 token 与额度）；`run-all` 更久。调用方必须给出「正在执行」反馈并
+ * 禁用按钮，否则用户会以为没反应而反复点击 —— 而重复点击会重复消耗。
+ */
+export function runGrowthTask(
+  action: "list" | "run" | "run-all",
+  accountId?: string,
+  taskCode?: string,
+): Promise<GrowthTaskResult> {
+  return call<GrowthTaskResult>("run_growth_task", { action, accountId, taskCode });
+}
+
+/**
  * 保存网关配置。
  *
  * 显式把 snake_case 字段转成 camelCase：Tauri 的 `invoke` 按
@@ -681,6 +846,24 @@ export function saveGatewayConfig(config: Partial<GatewayConfig>): Promise<{ con
   if (config.auto_start !== undefined) args.autoStart = config.auto_start;
   if (config.mode !== undefined) args.mode = config.mode;
   if (config.pinned_uid !== undefined) args.pinnedUid = config.pinned_uid;
+  if (config.manual_uids !== undefined) args.manualUids = config.manual_uids;
+  // 养号任务排程：同样显式转 camelCase，否则 Tauri 会静默丢弃这些字段
+  //（webui 的 HTTP 版兼容两种写法，桌面版只认 camelCase）。
+  if (config.activity_hours !== undefined) args.activityHours = config.activity_hours;
+  if (config.nightowl_hours !== undefined) args.nightowlHours = config.nightowl_hours;
+  if (config.school_hours !== undefined) args.schoolHours = config.school_hours;
+  if (config.trial_hours !== undefined) args.trialHours = config.trial_hours;
+  if (config.activity_enabled !== undefined) args.activityEnabled = config.activity_enabled;
+  if (config.nightowl_enabled !== undefined) args.nightowlEnabled = config.nightowl_enabled;
+  if (config.school_enabled !== undefined) args.schoolEnabled = config.school_enabled;
+  if (config.trial_enabled !== undefined) args.trialEnabled = config.trial_enabled;
+  if (config.activity_report_count !== undefined) {
+    args.activityReportCount = config.activity_report_count;
+  }
+  // 自定义系统提示词：同样显式转 camelCase，否则 Tauri 会静默丢弃
+  //（表现为「配了自定义提示词却总被重置」，且看不出是传参被丢）。
+  if (config.prompt_mode !== undefined) args.promptMode = config.prompt_mode;
+  if (config.prompt_file !== undefined) args.promptFile = config.prompt_file;
   return call<{ config: GatewayConfig }>("save_gateway_config", args);
 }
 
@@ -689,9 +872,29 @@ export function startGateway(port?: number): Promise<GatewayStartResult> {
   return call<GatewayStartResult>("start_gateway", port ? { port } : {});
 }
 
-/** 检测端口是否可用；被占用时返回建议端口。 */
+/** 检测端口是否可用；被占用时返回建议端口与占用进程。 */
 export function checkGatewayPort(port: number): Promise<GatewayPortCheck> {
   return call<GatewayPortCheck>("check_gateway_port", { port });
+}
+
+/** 结束占用端口的进程，让网关接管该端口。需用户明确确认后调用。 */
+export function killGatewayPortHolder(
+  port: number,
+): Promise<{ ok: boolean; pid: number; name: string; message: string }> {
+  return call("kill_gateway_port_holder", { port });
+}
+
+/**
+ * 查询占用端口的进程（供确认对话框展示）。
+ *
+ * 与 checkGatewayPort 的分工：后者在页面挂载/端口变化时就会调用（热路径），
+ * 因此**不查进程**；本函数只在用户点开对话框时调用，那时才值得付出
+ * spawn netstat/tasklist/powershell 的开销。
+ */
+export function getGatewayPortHolder(
+  port: number,
+): Promise<{ port: number; holder: GatewayPortHolder | null }> {
+  return call("get_gateway_port_holder", { port });
 }
 
 /** 停止网关。 */
@@ -714,21 +917,50 @@ export function syncGatewayAccounts(autoReload = true): Promise<GatewaySyncResul
  *
  * 与 saveGatewayConfig 的区别：那个只写配置文件，而网关账号池是启动时建立的，
  * 因此改完必须手动重启才生效。此接口把「保存 + 重导出凭证 + 按需重启」合成一步。
+ *
+ * @param manualUids 手动模式下勾选的账号列表（可多选）。
  */
 export function switchGatewayMode(
   mode: GatewayMode,
-  pinnedUid?: string | null,
+  manualUids?: string[] | null,
 ): Promise<GatewayModeSwitchResult> {
   return call<GatewayModeSwitchResult>("switch_gateway_mode", {
     mode,
-    pinnedUid: pinnedUid ?? null,
+    manualUids: manualUids ?? [],
   });
 }
 
 /**
- * 设置「单一模型 + 积分轮转」的目标模型；传空串清除锁定。
+ * 设置账号的禁用状态。
  *
- * 网关运行时后端会自动重启它以生效（模型锁定由网关启动时读取）。
+ * 语义：禁用 = 不进网关账号池；签到 / 旅行 / 上报等养号任务照跑。
+ * 后端会顺带重导出凭证并按需重启网关，做到「点了就生效」。
+ */
+export function setAccountDisabled(
+  accountId: string,
+  disabled: boolean,
+): Promise<{ ok: boolean; account: AccountMeta; sync?: unknown }> {
+  return call("set_account_disabled", { accountId, disabled });
+}
+
+/**
+ * 设置「限制使用的模型」白名单（多选）；传空数组 = 清除限制（全部放行）。
+ *
+ * **三个工作模式都生效**：网关会拒绝名单外的模型（400 model_not_allowed）。
+ * 网关运行时后端会自动重启它以生效（模型限制由网关启动时读取）。
+ *
+ * 为什么走 `set_allowed_models` 而不是旧的单值命令：旧命令只表达一个模型，
+ * 传数组时后端会解析失败。旧命令仍保留（向后兼容已发布的调用方）。
+ */
+export function setAllowedModels(models: string[]): Promise<GatewayModeSwitchResult> {
+  return call<GatewayModeSwitchResult>("set_allowed_models", { models });
+}
+
+/**
+ * 设置单个模型限制；传空串清除限制。
+ *
+ * @deprecated 多选请用 {@link setAllowedModels}。保留这个入口只为向后兼容
+ *（脚本、旧版界面自调用）。它现在等价于传一个单元素数组。
  */
 export function setAllowedModel(model: string): Promise<GatewayModeSwitchResult> {
   return call<GatewayModeSwitchResult>("set_allowed_model", { model });

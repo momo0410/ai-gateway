@@ -12,7 +12,7 @@ import {
   RefreshCw,
   TrendingDown,
   Users,
-  // XCircle, // 最近事件卡片隐藏后未使用
+  XCircle,
   type LucideIcon,
 } from "lucide-react";
 
@@ -44,7 +44,7 @@ import type {
   CreditResource,
   CreditStatsAccount,
   CreditStatsDailyPoint,
-  // CreditStatsEvent, // 最近事件卡片隐藏后未使用
+  CreditStatsEvent,
   CreditStatistics,
 } from "@/lib/types";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
@@ -237,7 +237,6 @@ function rangeUsage(
   }
 }
 
-/* 最近事件卡片隐藏后 checkinLabel 一并停用。恢复时取消本注释。
 function checkinLabel(result: string | null | undefined): string {
   switch (result) {
     case "success":
@@ -250,9 +249,8 @@ function checkinLabel(result: string | null | undefined): string {
       return "暂无记录";
   }
 }
-*/
 
-/* 仅账号积分明细表使用，表隐藏期间一并注释。
+/* 仅账号积分明细表使用，表隐藏期间一并注释（该表与下方「积分明细」重复）。
 function checkinBadgeVariant(
   result: string | null | undefined,
 ): "success" | "warning" | "destructive" | "outline" {
@@ -985,7 +983,6 @@ function OfficialUsageBreakdown({
   );
 }
 
-/* 最近事件卡片已隐藏，EventRow 一并停用。恢复时取消本注释。
 function EventRow({ event }: { event: CreditStatsEvent }) {
   if (event.kind === "usage") {
     return (
@@ -1029,7 +1026,6 @@ function EventRow({ event }: { event: CreditStatsEvent }) {
     </div>
   );
 }
-*/
 
 function ResourcesByAccount({
   accounts,
@@ -1089,11 +1085,10 @@ function SelectedAccountDetails({
   const visibleAccounts = effectiveFilter
     ? stats.accounts.filter((account) => account.accountId === effectiveFilter)
     : stats.accounts;
-  // 最近事件卡片已隐藏，events 不再使用。恢复时取消本注释。
-  // const events = (effectiveFilter
-  //   ? stats.events.filter((event) => event.accountId === effectiveFilter)
-  //   : stats.events
-  // ).slice(0, 50);
+  const events = (effectiveFilter
+    ? stats.events.filter((event) => event.accountId === effectiveFilter)
+    : stats.events
+  ).slice(0, 50);
   const latestSnapshotAt = visibleAccounts.reduce<number | null>((latest, account) => {
     if (account.lastSnapshotAt == null) return latest;
     if (latest == null || account.lastSnapshotAt > latest) return account.lastSnapshotAt;
@@ -1157,7 +1152,6 @@ function SelectedAccountDetails({
           )}
         </Card>
       </section>
-      {/* 最近事件卡片已隐藏。恢复时取消本注释。
       <section className="min-w-0 space-y-2.5" aria-labelledby="account-events-title">
         <div className="px-1">
           <h2 id="account-events-title" className="text-[13px] font-medium leading-5">最近事件</h2>
@@ -1177,12 +1171,11 @@ function SelectedAccountDetails({
           </CardContent>
         </Card>
       </section>
-      */}
     </div>
   );
 }
 
-/* 积分明细默认展示全部账号后不再单独使用。
+/* 积分明细默认展示全部账号后不再单独使用（页面改为直接渲染账号卡片）。
 function UnselectedRecentEvents({ events }: { events: CreditStatsEvent[] }) {
   return (
     <section className="min-w-0 space-y-2.5" aria-labelledby="all-events-title">

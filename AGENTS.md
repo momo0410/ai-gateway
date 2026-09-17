@@ -60,6 +60,88 @@ Token 统计与网关的接口契约可直接查阅实现本身：
 - 加密私钥的 keynum 偏移（54..62）与公钥（2..10）不同，**不能直接比对**；
   判断配对是否正确的唯一可靠方式是实际签一次，再比签名与公钥的 keyid。
 
+## 验证与测试（强制，血泪教训）
+
+所有者本机**正在运行这套软件**：`:7864` 是他的网关，`:43120` 是他运行 AI 对话的
+DSH Desktop。**任何验证都不得影响这两个进程。**
+
+### 绝对禁止：运行安装包 / 卸载器
+
+包括 `AI-Gateway_*_setup.exe` 与 `uninstall.exe`，**加了 `/S` 更危险**。
+
+原因：Tauri 的 NSIS 模板按**可执行文件名**匹配并结束进程，不比对路径：
+
+```nsis
+nsis_tauri_utils::FindProcessCurrentUser "${executableName}"
+nsis_tauri_utils::KillProcessCurrentUser "${executableName}"
+IfSilent kill_${UniqueID} 0        ; 静默模式下不询问，直接杀
+```
+
+主程序名 `ai-gateway.exe` 与所有者正在运行的实例**同名**，因此
+「装一次 / 卸一次」就会杀掉他的实例；而它是 Job Object（`KILL_ON_JOB_CLOSE`）
+的父进程，父进程一死，`:7864` 网关被系统连带回收 —— 一次误操作打掉两个服务。
+
+**验证安装包内容请用解包**：内嵌网关是 exe 内的一个 gzip 流，
+定位 `1F 8B 08` 魔数后解压即可与源码编译结果逐字节比对，无需安装。
+
+### 绝对禁止：按进程名批量结束进程
+
+```powershell
+# 禁止
+Get-Process -Name "gateway*" | Stop-Process
+```
+
+清理只允许**PID + 路径双条件**：
+
+```powershell
+$proc = Get-CimInstance Win32_Process -Filter "ProcessId=$pid" -ErrorAction SilentlyContinue
+if ($proc -and $proc.ExecutablePath -like "*test-bin*") { Stop-Process -Id $pid -Force }
+```
+
+### 验证一律用独立实例：独立名 + 独立端口 + 独立数据目录
+
+**陷阱**：`crates/ai-gateway-server`（server，约 15MB）与 `src-tauri`（GUI，约 30MB）
+的 `[[bin]] name` **都叫 `ai-gateway`**，输出到同一个 `target\release\ai-gateway.exe`
+互相覆盖。直接用它做接口测试可能拿到 **GUI** —— GUI 带单实例插件，
+发现所有者的实例在跑就**自己静默退出**（无输出、不监听），
+极易误判成「代码启动即退出」。
+
+```powershell
+# 1) 用独立 target 目录构建 server 版，避免覆盖 GUI 产物
+$tdir = "D:\WishProject\WorkbuddySwitchAPi\test-bin\build-server"
+cargo build --release -p ai-gateway-server --target-dir $tdir
+# 产物约 15MB = server 版；30MB 就是 GUI，别用
+
+# 2) 改名，确保与所有者的进程都不同名
+Copy-Item "$tdir\release\ai-gateway.exe" "D:\WishProject\WorkbuddySwitchAPi\test-bin\wb2api-server.exe"
+
+# 3) 独立数据目录 + 独立端口（避开 7864 / 43120 / 57890，用 5789x）
+$home1 = "D:\WishProject\WorkbuddySwitchAPi\test-bin\inst-xxx"
+New-Item -ItemType Directory -Force -Path $home1 | Out-Null
+$env:AI_GATEWAY_HOME = $home1
+$p = Start-Process -FilePath "...\wb2api-server.exe" -ArgumentList "serve","--port","57899","--no-open" `
+    -PassThru -WindowStyle Hidden -RedirectStandardOutput "$home1\o.log" -RedirectStandardError "$home1\e.log"
+"PID=$($p.Id)" | Out-File "$home1\pid.txt" -Encoding ascii
+```
+
+Go 侧的 `gateway.exe` 不存在上述覆盖问题，可直接构建到临时目录使用。
+
+### 前端/UI 验证不需要起后端
+
+用 `uitest/page-harness.cjs` + `uitest/mock-host-api.cjs`
+（静态服务 + mock 宿主 API + CDP 驱动真实 Chrome）。
+
+### 每次验证前后都自检
+
+```powershell
+foreach ($port in @(43120, 7864)) {
+    $c = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue
+    if (-not $c) { Write-Warning "所有者的 :$port 未在运行 —— 立即停止并报告" }
+}
+```
+
+详见 `uitest/README-验证约定.md`。
+
 ## Git Commit Language
 
 - Use Conventional Commit type prefixes such as `feat:`, `fix:`, and `docs:`.

@@ -3,10 +3,16 @@
 // 数据来源：每次成功请求结束后，从上游响应（非流式 usage 对象 / 流式 SSE 末帧
 // usage）提取 prompt/completion/cache 计量，按「服务器本地日期」聚合。
 //
-// 三个维度全部按天存储，导出时可按天数范围过滤：
+// 四个维度全部按天存储，导出时可按天数范围过滤：
 //   - days：全体请求（summary/daily 由它派生）
 //   - models：模型 × 日期
 //   - accounts：账号 × 日期
+//   - accountModels：账号 × 模型 × 日期
+//
+// accountModels 是唯一**不能**由其它维度推导出来的：models 与 accounts 各自
+// 聚合后，交叉关系已经丢失（只知道「甲账号共 3 万」「glm-5.2 共 4 万」，
+// 无法还原「甲账号的 glm-5.2 用了多少」）。界面「按账号筛选看用了哪些模型」
+// 必须读它，因此单独累计一份，而不是让前端拿两个维度硬凑。
 //
 // 持久化：与账号池 state.json 同目录的 usage.json；Record 只置脏标志，
 // 由后台 flusher 周期落盘，进程退出时 main 调用 Flush 兜底。
@@ -81,12 +87,16 @@ func (c Counters) Value() map[string]any {
 }
 
 // fileState usage.json 的磁盘结构。
+//
+// AccountModels 用 omitempty：老版本网关写下的文件没有这个键，读回来是 nil，
+// 由 load 兜底成空 map —— 不因为「多了个字段」就让既有历史统计失效。
 type fileState struct {
-	Version  int                            `json:"version"`
-	SavedAt  time.Time                      `json:"savedAt"`
-	Days     map[string]Counters            `json:"days"`
-	Models   map[string]map[string]Counters `json:"models,omitempty"`
-	Accounts map[string]map[string]Counters `json:"accounts,omitempty"`
+	Version       int                                       `json:"version"`
+	SavedAt       time.Time                                 `json:"savedAt"`
+	Days          map[string]Counters                       `json:"days"`
+	Models        map[string]map[string]Counters            `json:"models,omitempty"`
+	Accounts      map[string]map[string]Counters            `json:"accounts,omitempty"`
+	AccountModels map[string]map[string]map[string]Counters `json:"accountModels,omitempty"`
 }
 
 // Stats 网关 Token 用量聚合器。并发安全；path 为空时纯内存（不落盘）。
@@ -97,6 +107,8 @@ type Stats struct {
 	days     map[string]Counters
 	models   map[string]map[string]Counters
 	accounts map[string]map[string]Counters
+	// accountModels：uid -> model -> 日期 -> 计量。
+	accountModels map[string]map[string]map[string]Counters
 
 	// now 供测试注入时钟；nil 时用 time.Now。
 	now func() time.Time
@@ -105,10 +117,11 @@ type Stats struct {
 // New 构建统计器；path 非空时加载旧数据并启动后台落盘。
 func New(path string) *Stats {
 	s := &Stats{
-		path:     path,
-		days:     map[string]Counters{},
-		models:   map[string]map[string]Counters{},
-		accounts: map[string]map[string]Counters{},
+		path:          path,
+		days:          map[string]Counters{},
+		models:        map[string]map[string]Counters{},
+		accounts:      map[string]map[string]Counters{},
+		accountModels: map[string]map[string]map[string]Counters{},
 	}
 	if path != "" {
 		s.load()
@@ -155,6 +168,7 @@ func (s *Stats) RecordAt(uid, model string, at time.Time, c Counters) {
 	addTo(s.days, day, entry)
 	addTo(nested(s.models, model), day, entry)
 	addTo(nested(s.accounts, uid), day, entry)
+	addTo(nested2(s.accountModels, uid, model), day, entry)
 	s.dirty.Store(true)
 }
 
@@ -165,6 +179,19 @@ func nested(m map[string]map[string]Counters, key string) map[string]Counters {
 		m[key] = inner
 	}
 	return inner
+}
+
+// nested2 同 nested，但多一层键（账号 -> 模型 -> 日期）。
+//
+// 单独写一个而不是把 nested 泛型化：Go 的 map 嵌套每加一层类型就变一次，
+// 泛型版本为了省这几行会引入类型参数与约束，读起来比多一个 10 行函数更绕。
+func nested2(m map[string]map[string]map[string]Counters, key, sub string) map[string]Counters {
+	byModel, ok := m[key]
+	if !ok {
+		byModel = map[string]map[string]Counters{}
+		m[key] = byModel
+	}
+	return nested(byModel, sub)
 }
 
 func addTo(m map[string]Counters, key string, c Counters) {
@@ -192,18 +219,33 @@ func (s *Stats) Snapshot(days int) map[string]any {
 		dailyByModel[model] = daySeries(series, cutoff)
 	}
 
+	// accountModels：账号 -> 模型分组列表。
+	//
+	// 只保留**该范围内仍有计量**的账号与模型（groupList 会丢掉全空的），
+	// 因此「全部为 0 的账号」不会以空数组形式出现在响应里 —— 界面据此
+	// 区分「这个号这段时间没消耗」与「这个号根本不在统计里」。
+	accountModels := map[string]any{}
+	for uid, byModel := range s.accountModels {
+		groups := groupList(byModel, cutoff)
+		if len(groups) == 0 {
+			continue
+		}
+		accountModels[uid] = groups
+	}
+
 	var rangeDays any
 	if days > 0 {
 		rangeDays = days
 	}
 	return map[string]any{
-		"generatedAt":  now.UnixMilli(),
-		"rangeDays":    rangeDays,
-		"summary":      summary.Value(),
-		"models":       models,
-		"accounts":     accounts,
-		"daily":        daily,
-		"dailyByModel": dailyByModel,
+		"generatedAt":   now.UnixMilli(),
+		"rangeDays":     rangeDays,
+		"summary":       summary.Value(),
+		"models":        models,
+		"accounts":      accounts,
+		"accountModels": accountModels,
+		"daily":         daily,
+		"dailyByModel":  dailyByModel,
 	}
 }
 
@@ -299,11 +341,12 @@ func (s *Stats) flusher() {
 // fileStateLocked 收集内存状态为磁盘结构。调用方必须已持有 s.mu。
 func (s *Stats) fileStateLocked() fileState {
 	return fileState{
-		Version:  1,
-		SavedAt:  s.clock(),
-		Days:     s.days,
-		Models:   s.models,
-		Accounts: s.accounts,
+		Version:       1,
+		SavedAt:       s.clock(),
+		Days:          s.days,
+		Models:        s.models,
+		Accounts:      s.accounts,
+		AccountModels: s.accountModels,
 	}
 }
 
@@ -329,6 +372,14 @@ func (s *Stats) load() {
 	}
 	if fs.Accounts != nil {
 		s.accounts = fs.Accounts
+	}
+	// 老版本文件没有 accountModels（字段缺失 = nil）：保持 New 里的空 map，
+	// 让后续 Record 直接写入而不是往 nil map 里塞（那会 panic）。
+	//
+	// 这里**不**拿 models/accounts 去反推一份：反推出来的是「每个账号都用了
+	// 全部模型」这种假交叉，界面会显示成一堆错误的模型明细，比缺失更糟。
+	if fs.AccountModels != nil {
+		s.accountModels = fs.AccountModels
 	}
 }
 

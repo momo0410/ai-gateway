@@ -255,3 +255,33 @@ func LoadDir(dir string) ([]*Auth, error) {
 	}
 	return out, nil
 }
+
+// ---------------------------------------------------------------------------
+// 区域（realm）判定
+//
+// 账号分两个区域：国服（cn，copilot.tencent.com / codebuddy.cn）与国际版
+//（global，workbuddy.ai）。两者的可用模型、活动、端点都不同，
+// 因此「把请求发给哪个区域的账号」是一个需要显式表达的约束。
+//
+// 判定依据是登录域名后缀，与 upstream 侧的口径一致。
+// 放在 auth 包是因为 pool 需要它，而 pool 不能 import upstream（会循环依赖）。
+// ---------------------------------------------------------------------------
+
+// Realm 常量。
+const (
+	RealmCN     = "cn"
+	RealmGlobal = "global"
+)
+
+// Realm 返回账号所属区域（"cn" / "global"）。
+//
+// 为什么保留这个字符串版（上游已有类型化的 Region）：模型名前缀协议
+//（`cn:glm-5.2` / `global:...`）与前端展示用的都是字符串，growtask 的
+// AccountResult.Realm 要直接序列化给界面。两者是**同一判定的两种表示**，
+// 都委托给 IsIntl()，不存在两套独立逻辑（改判定只需改 IsIntl 一处）。
+func (a *Auth) Realm() string {
+	if a.IsIntl() {
+		return RealmGlobal
+	}
+	return RealmCN
+}

@@ -18,20 +18,23 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"strings"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/prompt"
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
 )
 
-// modelLockedError 「单一模型」模式拒绝了非目标模型的请求。
+// modelLockedError 请求的模型不在「限制使用的模型」白名单内。
 //
 // 单独成型（而不是拼一个字符串）是为了让调用方能识别它并回以 400 +
 // 明确的错误码，而不是当成「账号不可用」的 503 —— 后者会误导用户去查账号。
+//
+// 名字保留历史叫法（Locked）：错误码 model_not_allowed 与各协议的判定链
+// 都建在它上面，改名的收益抵不过动这条链的风险。
 type modelLockedError struct {
-	requested string // 客户端请求的模型（可能为空，表示请求体未带 model）
-	allowed   string // 当前锁定的模型
+	requested string   // 客户端请求的模型（可能为空，表示请求体未带 model）
+	allowed   []string // 当前放行的模型白名单（非空；空名单根本不会走到这里）
 }
 
 func (e *modelLockedError) Error() string {
@@ -39,8 +42,11 @@ func (e *modelLockedError) Error() string {
 	if got == "" {
 		got = "(未指定)"
 	}
-	return "当前为「单一模型」模式，只允许调用 " + e.allowed + "；收到的是 " + got +
-		"。请在客户端把模型改为 " + e.allowed + "，或切换网关的工作模式。"
+	list := allowedModelsText(e.allowed)
+	// 文案必须**列出全部**允许的模型：用户配了 3 个模型时只报「不允许 x」
+	// 完全没法排查 —— 他不知道该改成哪一个，只能挨个试。
+	return "当前已限制可使用的模型，只允许调用 " + list + "；收到的是 " + got +
+		"。请在客户端把模型改为 " + list + " 中的任意一个，或在界面的「放行模型」里调整限制。"
 }
 
 // chatResult 一次成功的上游调用结果。
@@ -113,7 +119,36 @@ func (h *Handler) forwardChat(body []byte, stream bool, sessKey string) (*chatRe
 
 	// 请求的目标模型：用于「模型级限流」的选号过滤与冷却记账。
 	// 取不到时为空串，各环节自动退化为原有行为（不做模型过滤）。
-	model := modelOf(body)
+	//
+	// 同时解析可选的区域前缀 `cn:` / `global:`：前缀只是给网关的**选号指令**，
+	// 上游不认识它，故必须把请求体里的 model 改写成裸名（见下方 rewriteModel）。
+	// 注意返回顺序是 (realm, bare) —— 写反会把区域当成模型名，
+	// 表现为「单一模型锁定」报「收到的是 (未指定)」。
+	//
+	// realm 不再参与选号：上游已把区域约束升级为 route/preferRegion
+	//（含「按区域的模型能力真值」），比字符串 realm 更完整且能区分
+	// 「偏好」与「强制」。这里只取 bare 用于改写请求体。
+	_, model := resolveModel(modelOf(body))
+
+	// 前缀只是给网关的**选号指令**，上游不认识它 —— 必须把请求体里的
+	// model 改写成裸名，否则上游返回 400 code=11102 model [cn:xxx] not found
+	//（实测确认：前缀成功约束了选号，却让请求本身失败）。
+	// 无前缀时 model 与原值相同，rewriteModel 会原样返回，不做多余序列化。
+	// 系统提示词替换必须排在 rewriteModel **之前**：两者都会重新序列化请求体，
+	// 先做提示词替换可以少一次整体编码，也避免「模型已改写成裸名、提示词却没换」
+	// 这种半改状态的中间结果出现在日志/排查视野里。
+	//
+	// 放在 forwardChat 而不是各协议入口：三种协议（chat / messages / responses）
+	// 的请求体都在这里汇合成 OpenAI Chat 形态，在此改写只需一处，
+	// 也不会漏掉任何一条出站路径。
+	//
+	// mode=passthrough（缺省）时**完全不调用** Rewrite：既有行为必须逐字不变
+	//（不重新序列化、不动 messages），因此这里是显式分支而非「传空串让它空转」。
+	if h.cfg.PromptMode == prompt.ModeCustom && h.cfg.PromptText != "" {
+		body = prompt.Rewrite(body, h.cfg.PromptText)
+	}
+
+	body = rewriteModel(body, model)
 
 	// 区域路由：仅对「图像能力两区不同」的模型 + 带图片的请求生效，
 	// 其余情况返回 RegionAny，行为与引入本特性之前完全一致。
@@ -121,18 +156,25 @@ func (h *Handler) forwardChat(body []byte, stream bool, sessKey string) (*chatRe
 	route := imageRouteFor(model, requestHasImage(body))
 	preferRegion := route.Region
 
-	// 「单一模型」锁定：非空时只放行该模型。
+	// 「限制使用的模型」白名单：非空时只放行名单内的模型。
 	//
-	// 为什么在选号之前就拒绝（而不是换个模型重试）：轮转模式的语义是
-	// 「把这个账号的指定模型额度烧干净再换号」，模型是策略的一部分。
-	// 若允许其他模型通过，客户端换个模型就能绕过轮转与额度控制，
-	// 也让「当前烧的是哪个模型」变得不可预期 —— 因此明确拒绝并说明原因，
-	// 比静默改写模型（用户以为在用 A、实际用了 B）更安全。
-	if allowed := h.cfg.AllowedModel; allowed != "" && !strings.EqualFold(model, allowed) {
+	// 为什么在选号之前就拒绝（而不是换个模型重试）：这份名单是**策略**的一部分
+	//（轮转模式下尤其如此 —— 语义是「把这个账号的指定模型额度烧干净再换号」）。
+	// 若允许其他模型通过，客户端换个模型就能绕过轮转与额度控制，也让「当前烧的
+	// 是哪个模型」变得不可预期 —— 因此明确拒绝并说明原因，比静默改写模型
+	//（用户以为在用 A、实际用了 B）更安全。
+	//
+	// 比较用的是剥前缀后的**裸模型名**（上面 resolveModel 的结果）：用户配的是
+	// `deepseek-v4.1-flash`，客户端可能带 `cn:` 前缀请求，两者应视为同一个模型。
+	// 大小写不敏感 —— 客户端写法并不统一。名单为空 = 不限制（默认，向后兼容）。
+	//
+	// 名单取自 h.allowed（NewHandler 里归一化并缓存），不是 h.cfg.AllowedModel ——
+	// 后者是单值的历史字段，已在归一化时合并进 h.allowed。
+	if !modelAllowed(h.allowed, model) {
 		// 返回非 nil 的 result：调用方会在错误分支里读 result.UID 记日志，
 		// 返回 nil 会 panic。UID 留空即可（本次没有选中任何账号）。
 		return &chatResult{Model: model}, http.StatusBadRequest,
-			&modelLockedError{requested: model, allowed: allowed}
+			&modelLockedError{requested: model, allowed: h.allowed}
 	}
 
 	for i := 0; i < h.cfg.MaxRotate; i++ {
@@ -393,6 +435,46 @@ func modelOf(body []byte) string {
 	}
 	_ = json.Unmarshal(body, &probe)
 	return probe.Model
+}
+
+// rewriteModel 把请求体里的 model 字段改成 bare。
+//
+// 为什么必须改写：`cn:` / `global:` 前缀只是**给网关的选号指令**，
+// 上游并不认识它。若把带前缀的原串原样转发，上游会返回
+//
+//	400 code=11102 model [cn:glm-5.2] service info not found
+//
+// 即「前缀成功约束了选号，却让请求本身失败」——
+// 实测确认过这个现象（前缀请求全部 11102，无前缀的同名请求正常）。
+//
+// bare 为空或与当前值相同时返回原 body（不重新序列化，避免无谓的格式变化）。
+// 解析失败时同样原样返回：宁可让上游报错，也不要把请求体改坏。
+func rewriteModel(body []byte, bare string) []byte {
+	if bare == "" {
+		return body
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return body
+	}
+	cur, ok := doc["model"]
+	if !ok {
+		return body // 没有 model 字段：无从改写
+	}
+	var curStr string
+	if err := json.Unmarshal(cur, &curStr); err != nil || curStr == bare {
+		return body // 不是字符串或无需改动
+	}
+	encoded, err := json.Marshal(bare)
+	if err != nil {
+		return body
+	}
+	doc["model"] = encoded
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 // requestHasImage 报告 OpenAI Chat 请求体里是否携带图片分片。

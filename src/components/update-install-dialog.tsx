@@ -12,6 +12,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import * as api from "@/lib/api";
+import { proxyScopeOf } from "@/lib/proxy-scope";
 import { GITHUB_RELEASE_URL, openReleaseUrl } from "@/lib/update";
 import type { UpdateInfo } from "@/lib/types";
 
@@ -97,9 +98,18 @@ export function UpdateInstallDialog({
         }
 
         const { check } = await import("@tauri-apps/plugin-updater");
+        // 代理**必须经过 Github 那个开关**：这条链路（检查 + 下载 + 安装）直接
+        // 调 tauri-plugin-updater，不经过后端 update_check，因此后端里的开关判断
+        // 在这里不生效。漏掉这一层，用户把 Github 开关关掉后下载仍会默默走代理 ——
+        // 而「关了开关却仍在走代理」正是本轮要消除的那类欺骗。
+        //
+        // 读失败（后端不可用）时按「不用代理」处理：宁可让下载失败并报网络错误，
+        // 也不要在用户明确关掉之后偷偷绕道。
         const configuredProxy = await api
           .getGithubConfig()
-          .then((config) => config.proxy?.trim() || "")
+          .then((config) =>
+            proxyScopeOf(config).github ? config.proxy?.trim() || "" : "",
+          )
           .catch(() => "");
         const candidate = await withTimeout(
           check({ proxy: configuredProxy || undefined }),

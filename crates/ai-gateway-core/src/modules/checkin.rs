@@ -200,6 +200,19 @@ fn decide_from_status(status: &Value) -> StatusDecision {
 
 /// 对单个账号执行完整签到流程：惰性刷新 → 查状态 → 未签到时提交 → 写提交日志。
 pub async fn checkin_account(account: &Value) -> Value {
+    // 区域门必须在这里也拦一道：批量路径靠 `accounts_in_scope` 过滤国际版，
+    // 但单账号入口（界面的「手动签到」、HTTP `/api/checkin`）绕过了它。
+    // 不拦的话会对国际版真实发请求，而上游 checkin-activity-status 恒返回
+    // active:false（无真实数据），用户看到「签到成功」其实什么也没发生 ——
+    // 这种「静默无效」比直接拒绝更糟。
+    // 界面已把国际版的签到项置灰，这里是后端的防御性一致（两者都要有，
+    // 因为 HTTP 接口可以被直接调用）。
+    if !crate::modules::config::account_supported_by_auto_tasks(account) {
+        return json!({
+            "result": "skipped",
+            "error": "国际版账号没有签到接口（上游恒返回未签到且无真实数据），已跳过",
+        });
+    }
     let Some(_account_guard) = AccountRunGuard::try_acquire(account) else {
         return json!({"result": "error", "error": "该账号正在签到，请稍后再试"});
     };
@@ -248,6 +261,15 @@ pub async fn checkin_account(account: &Value) -> Value {
         entry_map["error"] = json!(e);
     }
     add_checkin_log(&entry_map);
+    // 同时写一条账号记录：签到日志只服务「签到」板块，
+    // 而账号记录视图要把三类事件（任务 / 积分 / Token）汇到一处。
+    {
+        use crate::modules::account_records;
+        let account_id = entry["accountId"].as_str().unwrap_or("");
+        let account_name = entry["email"].as_str().unwrap_or("");
+        let detail = error.clone().unwrap_or_default();
+        account_records::add_task_record(account_id, account_name, "自动签到", result, &detail);
+    }
     json!({"result": result, "error": error})
 }
 

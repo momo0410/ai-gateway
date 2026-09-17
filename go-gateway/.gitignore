@@ -31,3 +31,10 @@ docs/
 # 设计/计划文档（但 README.md 必须进版本库）
 *.md
 !README.md
+
+# defaultprompt.md 是**运行时资源**，不是文档：它由 //go:embed 编进二进制，
+# 是「自定义系统提示词」功能的内置默认值。被上面的 *.md 误伤后本地能构建
+#（文件在磁盘上），CI 却会 `pattern defaultprompt.md: no matching files found`
+# 直接失败 —— 这类「本地过、CI 挂」最难查，故显式放行。
+!internal/prompt/defaultprompt.md
+

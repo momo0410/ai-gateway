@@ -7,7 +7,10 @@ import (
 	"workbuddy2api/internal/auth"
 )
 
-// 现场数据（所有者 2026-09-15，14 个账号 / 真实 expire_at）。
+// 现场数据（2026-09-15 实测场景，14 个账号）。
+//
+// 账号标识已脱敏为合成 id：本仓库是公开仓库，真实 uid 不应入库。
+// credits / expire_at 保留原值 —— 它们才是测试语义所在（档位与排队判定）。
 //
 // 现场观测：4 个更早档位账号对主力模型 deepseek-v4.1-flash 模型冷却，
 // 流量落在 10-11 档的 8 个账号，10-14 档的 2 个排队 —— 正是所有者问的
@@ -17,20 +20,20 @@ var queuedFieldAccounts = []struct {
 	credits int64
 	expire  int64
 }{
-	{"3b5d6048", 4721, 1790827287}, // 10-01
-	{"11b8eb03", 7266, 1791248123}, // 10-06
-	{"4ea736d4", 2231, 1791631663}, // 10-10
-	{"599bfa43", 2389, 1791631558}, // 10-10
-	{"1f3c55e5", 2141, 1791695172}, // 10-11
-	{"6a173999", 5524, 1791693914}, // 10-11
-	{"7ffd1102", 2085, 1791696294}, // 10-11
-	{"c644e54a", 2144, 1791688504}, // 10-11
-	{"d1671c77", 2158, 1791695539}, // 10-11
-	{"e2891116", 5878, 1791688505}, // 10-11
-	{"e94c5d4f", 2101, 1791695043}, // 10-11
-	{"fd6b410d", 2097, 1791694658}, // 10-11
-	{"be6454cc", 2200, 1791951767}, // 10-14
-	{"f530e233", 1643, 1791952524}, // 10-14
+	{"acct-a1", 4721, 1790827287}, // 10-01
+	{"acct-a2", 7266, 1791248123}, // 10-06
+	{"acct-a3", 2231, 1791631663}, // 10-10
+	{"acct-a4", 2389, 1791631558}, // 10-10
+	{"acct-b1", 2141, 1791695172}, // 10-11
+	{"acct-b2", 5524, 1791693914}, // 10-11
+	{"acct-b3", 2085, 1791696294}, // 10-11
+	{"acct-b4", 2144, 1791688504}, // 10-11
+	{"acct-b5", 2158, 1791695539}, // 10-11
+	{"acct-b6", 5878, 1791688505}, // 10-11
+	{"acct-b7", 2101, 1791695043}, // 10-11
+	{"acct-b8", 2097, 1791694658}, // 10-11
+	{"acct-c1", 2200, 1791951767}, // 10-14
+	{"acct-c2", 1643, 1791952524}, // 10-14
 }
 
 func newQueuedFieldPool() *Pool {
@@ -50,7 +53,7 @@ func newQueuedFieldPool() *Pool {
 func TestQueuedFlagMatchesLiveScenario(t *testing.T) {
 	p := newQueuedFieldPool()
 	// 现场：前 4 个对主力模型冷却
-	for _, uid := range []string{"3b5d6048", "11b8eb03", "4ea736d4", "599bfa43"} {
+	for _, uid := range []string{"acct-a1", "acct-a2", "acct-a3", "acct-a4"} {
 		p.CooldownModel(uid, "deepseek-v4.1-flash", time.Now().Add(4*time.Hour), "限流", true)
 	}
 
@@ -71,8 +74,8 @@ func TestQueuedFlagMatchesLiveScenario(t *testing.T) {
 
 	// 10-11 档 8 个：正在服务，不得标成排队
 	for _, uid := range []string{
-		"1f3c55e5", "6a173999", "7ffd1102", "c644e54a",
-		"d1671c77", "e2891116", "e94c5d4f", "fd6b410d",
+		"acct-b1", "acct-b2", "acct-b3", "acct-b4",
+		"acct-b5", "acct-b6", "acct-b7", "acct-b8",
 	} {
 		if queued[uid] {
 			t.Errorf("%s 属于当前生效档位（10-11），不应标为排队", uid)
@@ -80,14 +83,14 @@ func TestQueuedFlagMatchesLiveScenario(t *testing.T) {
 	}
 
 	// 10-14 档 2 个：正是所有者问的「少掉的两个」，必须标为排队
-	for _, uid := range []string{"be6454cc", "f530e233"} {
+	for _, uid := range []string{"acct-c1", "acct-c2"} {
 		if !queued[uid] {
-			t.Errorf("%s 档位 10-14 晚于生效档位，应标为排队（这是所有者困惑的那两个账号）", uid)
+			t.Errorf("%s 档位 10-14 晚于生效档位，应标为排队（这是当初困惑的那两个账号）", uid)
 		}
 	}
 
 	// 被模型冷却的更早档位账号：不是「排队」（它们档位更早），而是被模型冷却挡住
-	for _, uid := range []string{"3b5d6048", "11b8eb03", "4ea736d4", "599bfa43"} {
+	for _, uid := range []string{"acct-a1", "acct-a2", "acct-a3", "acct-a4"} {
 		if queued[uid] {
 			t.Errorf("%s 档位早于生效档位，其不可用原因是模型冷却而非排队", uid)
 		}
@@ -154,7 +157,7 @@ func TestQueuedFlagClearedWhenEarlierTierUnavailable(t *testing.T) {
 		t.Fatalf("生效档位 = %q，期望下沉到 2026-10-14", day)
 	}
 	for _, st := range p.List() {
-		if st.UID == "be6454cc" || st.UID == "f530e233" {
+		if st.UID == "acct-c1" || st.UID == "acct-c2" {
 			if st.Queued {
 				t.Errorf("%s 现在是最早可用档位，不应再排队", st.UID)
 			}

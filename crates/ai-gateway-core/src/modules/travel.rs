@@ -1043,6 +1043,16 @@ pub async fn run_travel_now() -> Value {
 ///   - `skip="no-buddy"`        领养失败（可重试）
 ///   - `skip="buddy-unknown"`   查询失败，未做任何写操作
 pub async fn adopt_for_account(account: &Value) -> Value {
+    // 与 checkin_account 同理：批量路径靠 `accounts_in_scope` 过滤国际版，
+    // 单账号入口绕过了它。国际版没有 Buddy 领养入口（上游 404），
+    // 不拦会对它真实发请求并拿到无意义结果。
+    if !crate::modules::config::account_supported_by_auto_tasks(account) {
+        return json!({
+            "ok": false,
+            "skipped": true,
+            "message": "国际版账号没有 Buddy 领养入口，已跳过",
+        });
+    }
     let cfg = load_checkin_config();
     let acc = ensure_fresh_token(account.clone(), &cfg).await;
     let uid = acc.get("uid").and_then(Value::as_str).map(String::from);

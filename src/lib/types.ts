@@ -26,6 +26,14 @@ export interface AccountMeta {
    * 「这是谁的号、干什么用的」。备注只存本地，不参与登录。
    */
   note?: string | null;
+  /**
+   * 用户手动禁用：不进网关账号池。
+   *
+   * 注意：禁用的只是「接流量的资格」，签到 / 旅行 / 领奖等养号任务照跑 ——
+   * 号暂时不接流量不等于不要额度与连登天数。这与网关内部因冷却/熔断而
+   * 临时不可用完全不同：后者会自行恢复，前者只能由用户显式改回。
+   */
+  disabled?: boolean;
   /** 原始域名（如 www.workbuddy.ai / copilot.tencent.com）—— 排查时比区域标签更具体。 */
   domain?: string | null;
   /** 手机号（国服账号的真实身份线索；其 email 常为空）。 */
@@ -476,10 +484,43 @@ export interface CodeBuddyCliInstallResult {
   error?: string;
 }
 
+/**
+ * 代理的**适用范围**（三个独立开关）。
+ *
+ * 为什么把「一个代理地址」拆成三个开关：同一个地址对不同用途的收益完全不同 ——
+ * GitHub（检查更新 / 下载安装包）在国内基本必须走代理；国际版上游
+ *（workbuddy.ai）国内直连实测 wsarecv 超时，也需要；而国服上游
+ *（codebuddy.cn / copilot.tencent.com）直连即通，绕进代理只会多一跳延迟、
+ * 多一个故障面（代理一挂，本来好好的国服账号跟着不可用）。
+ *
+ * 地址仍然只填一次（用户不该填三遍），三个开关只决定「哪些用途使用它」。
+ */
+export interface ProxyScope {
+  /** 检查更新与下载安装包时是否使用代理。默认开。 */
+  github: boolean;
+  /**
+   * 国服账号（*.workbuddy.cn / *.codebuddy.cn / copilot.tencent.com）的上游请求是否使用代理。
+   *
+   * 默认关：国内直连通常更快；且关了之后是**真直连**（连 HTTPS_PROXY 也不用）。
+   */
+  cn: boolean;
+  /**
+   * 国际版账号（*.workbuddy.ai / *.codebuddy.ai）的上游请求是否使用代理。
+   *
+   * 默认开：国内直连实测不稳定（wsarecv 超时），不走代理基本用不了。
+   */
+  intl: boolean;
+}
+
 export interface GithubConfig {
   owner?: string;
   repo?: string;
   proxy?: string;
+  /**
+   * 三个开关。**允许缺失**：老配置 / 老后端里没有这个字段，
+   * 读取方必须用 `proxyScopeOf()` 兜底成默认值，不能自己当 false 处理。
+   */
+  proxy_scope?: Partial<ProxyScope> | null;
 }
 
 export interface UpdateInfo {
@@ -529,22 +570,39 @@ export interface CodeBuddyCnIdeSwitchResult {
  * pinned  —— 指定账号：只使用 pinned_uid 对应的那一个账号
  * rotation —— 单一模型 + 积分轮转：只用一个账号烧到不可用，再换按到期日
  *             排序的下一个（仍优先烧最快过期的额度）                      */
-export type GatewayMode = "balance" | "pinned" | "rotation";
+/**
+ * 网关工作模式。
+ *
+ * - `balance` 自动：全部（未禁用的）账号参与，池内加权随机 + 到期日分层
+ * - `manual`  手动：只使用勾选的账号，池内仍自动均衡
+ * - `rotation` 积分轮转：单一模型烧号，按到期日换下一个
+ *
+ * `pinned` 是历史值，读作 `manual`（后端 `GatewayMode::from_str` 已兼容）。
+ */
+export type GatewayMode = "balance" | "manual" | "rotation";
 
 export interface GatewayConfig {
   /** 是否已启用（启动过即为 true）。 */
   enabled: boolean;
   /** 网关工作模式。 */
   mode?: GatewayMode;
-  /** 指定账号模式下锁定的账号 uid。 */
+  /** 手动模式下勾选的账号 uid 列表（可多选）。 */
+  manual_uids?: string[];
+  /** 指定账号模式下锁定的账号 uid（旧字段，仅向后兼容）。 */
   pinned_uid?: string | null;
   /**
-   * 「单一模型 + 积分轮转」锁定的模型名（仅 rotation 模式生效）。
+   * 「限制使用的模型」白名单（多选）。**空数组 = 不限制（默认，全部放行）**。
    *
-   * 非空时网关**只放行该模型**，其余模型返回 400 model_not_allowed ——
-   * 轮转的语义是「把这个账号的指定模型额度烧干净再换号」，模型是策略的一部分。
+   * 非空时网关**只放行名单内的模型**，其余一律 400 model_not_allowed。
+   * **三个工作模式（自动 / 手动 / 积分轮转）都生效** —— 它限制的是「放行哪些
+   * 模型」，与「用哪些账号」是正交的两件事。
+   *
+   * 联合类型里的 `string` 是**向后兼容**，不是冗余：老配置里这个键是单值字符串
+   *（实测所有者本机的 gateway_config.json 就是 `"allowed_model":
+   * "deepseek-v4.1-flash"`）。声明成 `string[]` 会让读取方以为可以直接
+   * `.length` / `.map`，在老配置上运行时炸掉。
    */
-  allowed_model?: string | null;
+  allowed_model?: string[] | string | null;
   /** 服务端口（权威字段，前端口选择器直接编辑它）。 */
   port: number;
   /** 监听地址，由 port 派生，如 ":7863"。 */
@@ -555,6 +613,163 @@ export interface GatewayConfig {
   auto_start: boolean;
   last_status?: string | null;
   last_error?: string | null;
+
+  // ---- 自动养号任务排程（写进网关 config.json 的 schedule 块）----
+  //
+  // 这些字段由宿主读取后转写到网关的 native config；网关只认它自己的 config.json，
+  // 因此改这里必须重启网关才会生效。
+
+  /** 活跃上报时点（小时列表，默认 [10]）：点亮连登天数并解锁领养前置。 */
+  activity_hours?: number[];
+  /** 夜猫子任务时点（默认 [1]）：仅在 23:00–08:00 北京时间内计入。 */
+  nightowl_hours?: number[];
+  /** 开学季活动任务时点（默认 [12]）：限时活动，只领取已达标的奖励。 */
+  school_hours?: number[];
+  /** 国际版 trial 加油包领取时点（默认 [9, 21]，仅国际版账号）。 */
+  trial_hours?: number[];
+  activity_enabled?: boolean;
+  nightowl_enabled?: boolean;
+  school_enabled?: boolean;
+  trial_enabled?: boolean;
+  /** 每号每日活跃上报条数（默认 3，上限 20）。 */
+  activity_report_count?: number;
+
+  // ---- 自定义系统提示词（写进网关 config.json 的 prompt 块）----
+  //
+  // 由宿主转写到网关 native config 的 prompt 块（Go 侧 Config.Prompt）。
+  // 与 features.sanitize_blacklist_fingerprints 是**两层叠加、互不替代**：
+  // 那个清洗消息里的指纹串，这个把 system/developer 消息整体替换。
+
+  /**
+   * 提示词模式；缺省 `"passthrough"` = 透传客户端原始 system（既有行为不变）。
+   *
+   * `"custom"` = 用网关自有提示词替换客户端的 system/developer 消息。
+   * 缺省刻意不是 custom：老配置没有这个键，若缺省 custom，既有用户升级后
+   * system 会被静默替换（人设、项目约定、工具说明全丢）。
+   */
+  prompt_mode?: "passthrough" | "custom";
+  /** 自定义提示词文件路径；空 = 用网关内置默认提示词。 */
+  prompt_file?: string;
+}
+
+/** 手动触发养号任务的结果（POST /api/gateway/task-run）。 */
+export interface GatewayTaskRunResult {
+  ok: boolean;
+  /** 是否真的执行了一轮；false = 被前置条件挡下（见 skip / message）。 */
+  ran: boolean;
+  /**
+   * 跳过原因码；`ran=true` 时为空。
+   *
+   * - `outside_window`：不在夜猫子时段（23:00–08:00 北京时间）
+   * - `already_running`：该任务上一轮还在执行
+   */
+  skip?: string | null;
+  /** 面向用户的中文说明，可直接显示。 */
+  message: string;
+  /** 调用失败的原因（网关未启动、任务名不认识等）；成功时为 null。 */
+  error?: string | null;
+}
+
+/** 养号任务标识（与 Go 网关 /tasks/run 的 task 参数一一对应）。 */
+export type GatewayTaskName = "activity" | "nightowl" | "school" | "trial";
+
+/**
+ * 成长任务的展示状态（Go 侧 growtask 的 View* 常量）。
+ *
+ * 与养号任务的 `ran/skip` 不同，成长任务是**逐任务**的结果，
+ * 因此每个任务自己带状态与进度。
+ */
+export type GrowthTaskStatus =
+  | "claimable"
+  | "in_progress"
+  | "not_accepted"
+  | "accepted"
+  | "claimed"
+  | "unsupported"
+  | "locked";
+
+/** 成长任务列表里的一项（action=list）。 */
+export interface GrowthTaskView {
+  task_code: string;
+  title?: string;
+  /** 客户端操作指引（多用于 `unsupported` 的任务）。 */
+  description?: string;
+  /** 达成条件简述。 */
+  task_desc?: string;
+  /** 奖励积分 / 能量。 */
+  credit?: number;
+  energy?: number;
+  status: GrowthTaskStatus;
+  /** 状态的中文说明，界面可直接显示。 */
+  status_text: string;
+  accept_status?: string;
+  /** 上游是否下发了进度。**未报名时为 false**（progress 为 null）。 */
+  has_progress?: boolean;
+  /** "当前/目标"，如 "3/5"；无进度时为空。 */
+  progress?: string;
+  claimable?: boolean;
+  /** 能否被本工具自动完成。false 时只展示指引，不提供「一键完成」。 */
+  automatable?: boolean;
+  /** 该项需要**真实对话**才能推进（会消耗 token 与额度），界面应提示。 */
+  needs_chat?: boolean;
+  /** 本工具会执行什么动作（中文说明）。 */
+  action_desc?: string;
+  /** 无法自动完成时的原因说明。 */
+  hint?: string;
+}
+
+/** 单项任务的执行结果（action=run）。 */
+export interface GrowthTaskItemResult {
+  task_code: string;
+  title?: string;
+  desc?: string;
+  status: "done" | "skipped" | "error" | "unsupported";
+  message: string;
+  /** 动作前后进度（"当前/目标"）——「上报 200 ≠ 计分」的证据。 */
+  progress_before?: string;
+  progress_after?: string;
+  claimed?: boolean;
+  credit?: number;
+  energy?: number;
+  claim_error?: string;
+}
+
+/**
+ * 成长任务「一键完成」的返回。
+ *
+ * 三种 action 的返回形状不同（list 带 tasks / run 带 items / run-all 带 results），
+ * 故这里是**联合形状**而非各自独立的类型 —— 界面按 action 取用对应字段。
+ * 失败时 `ok=false` + `error`，且**不抛 HTTP 错误**：部分成功也要能拿到已完成的部分。
+ */
+export interface GrowthTaskResult {
+  ok: boolean;
+  error?: string;
+  /** action=list 时返回。 */
+  accountId?: string;
+  tasks?: GrowthTaskView[];
+  total?: number;
+  /** action=run（未指定 taskCode）时返回。 */
+  items?: GrowthTaskItemResult[];
+  /** action=run（指定 taskCode）时返回。 */
+  item?: GrowthTaskItemResult;
+  /** action=run-all 时返回。 */
+  results?: Array<{
+    uid: string;
+    realm: string;
+    skipped?: boolean;
+    skip_reason?: string;
+    items?: GrowthTaskItemResult[];
+    claimed?: number;
+    credit?: number;
+    energy?: number;
+    error?: string;
+  }>;
+  summary?: {
+    accounts?: number;
+    claimed?: number;
+    credit?: number;
+    energy?: number;
+  };
 }
 
 /** 单个「账号+模型」的冷却记录（来自网关 /status 的 model_cooling）。 */
@@ -584,6 +799,20 @@ export interface GatewayPoolAccount {
   success_count?: number;
   err_total?: number;
   in_flight?: number;
+  /**
+   * 最近一次成功调用的时刻（ISO 8601；Go 侧 `pool.Status.LastSuccessTime`）。
+   *
+   * 与 `success_count` 的分工：计数回答「一共成了多少次」，本字段回答「上一次成
+   * 是什么时候」—— 后者才能区分「一直在稳定成功」与「早就不再被选中了」
+   * （计数是个只增不减的累计值，看不出停滞）。
+   */
+  last_success?: string;
+  /** 最近一次失败的时刻（ISO 8601）；供「最近成功」旁证用。 */
+  last_err?: string;
+  /** 连续失败计数（熔断器输入；达到阈值即熔断）。 */
+  breaker_fails?: number;
+  /** 熔断截止时刻（ISO 8601）；非空且未过期 = 正在熔断期。 */
+  breaker_until?: string;
   /** 「最近到期积分」的到期时刻（Unix 秒）；缺省 = 未知。 */
   soonest_expire_at?: number;
   /** 到期日（YYYY-MM-DD），即选号分层档位键；同一天的账号同级。 */
@@ -618,6 +847,16 @@ export interface GatewayPool {
   redis_mode?: string;
 }
 
+/** 网关状态里「可选账号」一项（手动模式勾选列表的数据源）。 */
+export interface GatewayStatusAccount {
+  uid: string;
+  nickname?: string;
+  expiresAt?: number;
+  needsRelogin?: boolean;
+  /** 用户手动禁用：勾选列表里不再展示（勾了也不会进池）。 */
+  disabled?: boolean;
+}
+
 /** 网关综合状态。 */
 export interface GatewayStatus {
   running: boolean;
@@ -635,13 +874,8 @@ export interface GatewayStatus {
   mode?: GatewayMode;
   /** 指定账号模式锁定的 uid。 */
   pinnedUid?: string | null;
-  /** 可选账号列表（供「指定账号」下拉使用）。 */
-  accounts?: Array<{
-    uid: string;
-    nickname?: string;
-    expiresAt?: number;
-    needsRelogin?: boolean;
-  }>;
+  /** 可选账号列表（供手动模式的勾选列表使用）。 */
+  accounts?: GatewayStatusAccount[];
   /**
    * 因「需重新登录」而被排除出网关账号池的账号。
    *
@@ -656,8 +890,64 @@ export interface GatewayStatus {
   authDir: string;
   accountsInLibrary: number;
   config: GatewayConfig;
+  /**
+   * 正在执行的养号任务（含进度）。
+   *
+   * 所有者明确要求「账号卡片上要能看到正在执行的任务」—— 此前点「立即执行」
+   * 只有一个按钮转圈，看不到在跑什么、跑到哪、哪些账号在跑。
+   */
+  taskRuntime?: GatewayTaskRuntime;
   health: { reachable?: boolean; healthy?: boolean; detail?: unknown } | null;
   pool: GatewayPool | null;
+}
+
+/**
+ * 正在执行的养号任务的运行态（来自 `GET /api/gateway/status` 的 `taskRuntime`）。
+ *
+ * 进度是**近似值**，口径如下（见 Rust 侧 `task_runtime`）：
+ *   - `total` 是按账号库 + 任务区域规则算出的**预计**账号数；
+ *   - `processed` / `processedIds` 来自统一事件流的**实际**已记录账号。
+ * 两者可能短暂不等（网关账号池与账号库有极小时差），因此文案写成
+ * 「已记录 N / M」而不是断言性的「已完成」。
+ */
+export interface GatewayTaskRuntime {
+  /** false = 当前没有任务在跑；此时其余字段不保证存在。 */
+  running: boolean;
+  /** 任务标识（与 `GatewayTaskName` 对应）。 */
+  task?: GatewayTaskName;
+  /** 面向用户的任务中文名，可直接显示。 */
+  label?: string;
+  /** 开始时刻（毫秒时间戳）。 */
+  startedAt?: number;
+  /** 已运行毫秒数（后端算好，避免前后端时钟偏差）。 */
+  elapsedMs?: number;
+  /** 本轮预计遍历的账号数（进度分母）。 */
+  total?: number;
+  /** 已留下记录的账号数（进度分子）。 */
+  processed?: number;
+  /**
+   * 已留下记录的账号在**宿主账号库里的 id**（不是网关 uid）。
+   * 供账号卡片标记「这个号正在跑」。
+   */
+  processedIds?: string[];
+}
+
+/**
+ * 账号卡片上的「本轮已跑」标记（由 `AccountsPage` 从 `taskRuntime` 推导后下发）。
+ *
+ * 为什么措辞是「已跑」而不是「正在跑」：后端只透出 `processedIds` —— 它是
+ * **已经留下记录**的账号集合（见 Rust 侧 `task_runtime`），而 Go 侧记录是在
+ * **处理完一个账号之后**才写（`scheduler/activity.go` 等）。也就是说，
+ * 本轮**当前正在处理**的那个号还没进集合，后端也没有「当前是哪个号」这个字段。
+ * 因此界面照实说「本轮已跑」，不编造一个后端并不提供的「正在跑这个号」。
+ */
+export interface AccountRunningTask {
+  /** 任务中文名（取自 `taskRuntime.label`，如「活跃上报」）。 */
+  label: string;
+  /** 本轮已留下记录的账号数（分子）。近似值，口径见卡片悬停提示。 */
+  processed?: number;
+  /** 本轮预计遍历的账号数（分母）。 */
+  total?: number;
 }
 
 /** GET /api/gateway/config 响应。 */
@@ -711,6 +1001,23 @@ export interface GatewayPortCheck {
   inUseByGateway: boolean;
   /** 端口被占用时给出的可用建议端口。 */
   suggest: number | null;
+  /** 占用该端口的进程；查不到时为 null（权限不足或进程已退出）。 */
+  holder: GatewayPortHolder | null;
+}
+
+/** 占用端口的进程信息。 */
+export interface GatewayPortHolder {
+  pid: number;
+  name: string;
+  /** 可执行文件完整路径；权限不足时为空串。 */
+  path: string;
+  /**
+   * 是否为本项目自己的进程（网关 / 宿主 GUI）。
+   *
+   * 前端据此调整提示措辞：清理自己的旧进程是常见操作，
+   * 而结束第三方进程需要更强的警告。
+   */
+  ours: boolean;
 }
 
 /** 网关 Token 用量中的一组计量（口径与本地 Token 统计页一致）。 */
@@ -743,6 +1050,17 @@ export interface GatewayUsageSnapshot {
   summary?: GatewayUsageTotals;
   models?: GatewayUsageGroup[];
   accounts?: GatewayUsageGroup[];
+  /**
+   * 账号 → 该账号用过的模型明细（键 = 池 uid）。
+   *
+   * 为什么不能由 `models` 与 `accounts` 前端现算：这两个维度各自聚合后，
+   * 交叉关系已经丢失 —— 只知道「甲账号共 3 万」「glm-5.2 共 4 万」，
+   * 无法还原「甲账号的 glm-5.2 用了多少」。由网关侧记录时直接累计，
+   * 界面「按账号筛选看用了哪些模型」才有可信数据。
+   *
+   * 缺失（老版本网关）时按「无明细」处理，不回退到假的交叉结果。
+   */
+  accountModels?: Record<string, GatewayUsageGroup[]>;
   /** 按日期升序的日聚合。 */
   daily?: GatewayUsageGroup[];
   dailyByModel?: Record<string, GatewayUsageGroup[]>;

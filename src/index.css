@@ -17,6 +17,11 @@
   --secondary-foreground: oklch(0.32 0.01 264);
   --muted: oklch(0.96 0.004 264);
   --muted-foreground: oklch(0.52 0.012 264);
+  /* muted-strong 次级但**必须看得清**的文字（Token 用量区块的「共 N 个」/ 行内数值
+     / 行内 meta）。比 muted-foreground 深一档：诊断对真实渲染取色实测，原色只有
+     2.97:1，低于 WCAG AA 的 4.5:1，而它恰恰是唯一携带筛选口径信息的元素。
+     本 token 在 --background 上约 7.5:1、在 --card 上约 7.9:1，留足余量。 */
+  --muted-strong: oklch(0.42 0.014 264);
   --accent: oklch(0.955 0.004 264);
   --accent-foreground: oklch(0.24 0.01 264);
   --destructive: oklch(0.577 0.245 27.325);
@@ -26,6 +31,17 @@
   --ring: oklch(0.725 0.133 163.03);
   --brand: oklch(0.725 0.133 163.03);
   --brand-foreground: oklch(0.985 0.002 247.839);
+  /* info 信息蓝：用于「用户自己写的内容」这类需要与系统状态（绿）区分的标记。
+     具体用途见 .chip-note —— 备注标签用它，好让「这是我起的名字」一眼可辨，
+     而不是和「国服」这种自动状态同色（所有者反馈过备注不够明显）。 */
+  --info: oklch(0.62 0.13 250);
+  --info-foreground: oklch(0.99 0.002 250);
+  /* warning 琥珀：用于「系统层面的限流告警」（账号池的模型冷却角标、冷却态标签）。
+     与 --info（蓝＝用户自己写的内容）语义分开：蓝＝你写的，琥珀＝系统报的。
+     此前这些地方散着写 amber-500/600 的 Tailwind 调色板值，主题切换时无法统一
+     调整，也与 Rhea token 体系脱节。 */
+  --warning: oklch(0.705 0.15 70);
+  --warning-foreground: oklch(0.99 0.002 70);
   --chart-1: oklch(0.646 0.222 41.116);
   --chart-2: oklch(0.6 0.118 184.704);
   --chart-3: oklch(0.398 0.07 227.392);
@@ -64,6 +80,9 @@
   --secondary-foreground: oklch(0.929 0.013 255.508);
   --muted: oklch(0.279 0.041 260.031);
   --muted-foreground: oklch(0.704 0.04 256.788);
+  /* muted-strong（暗色）：深底上不能继续压暗，改为向白提亮一档，与亮色下「比
+     muted-foreground 更醒目」的语义保持一致。 */
+  --muted-strong: oklch(0.86 0.02 258);
   --accent: oklch(0.279 0.041 260.031);
   --accent-foreground: oklch(0.929 0.013 255.508);
   --destructive: oklch(0.704 0.191 22.216);
@@ -73,6 +92,12 @@
   --ring: oklch(0.696 0.17 162.48);
   --brand: oklch(0.696 0.17 162.48);
   --brand-foreground: oklch(0.208 0.042 265.755);
+  /* info 信息蓝（暗色）：提亮并略降饱和，否则深底上会发闷、与主色绿难分辨。 */
+  --info: oklch(0.68 0.12 250);
+  --info-foreground: oklch(0.208 0.042 265.755);
+  /* warning 琥珀（暗色）：深底上必须提亮，否则与背景对比不足、看起来像禁用态。 */
+  --warning: oklch(0.78 0.14 72);
+  --warning-foreground: oklch(0.208 0.042 265.755);
   --chart-1: oklch(0.488 0.243 264.376);
   --chart-2: oklch(0.696 0.17 162.48);
   --chart-3: oklch(0.769 0.188 70.08);
@@ -109,6 +134,7 @@
   --color-secondary-foreground: var(--secondary-foreground);
   --color-muted: var(--muted);
   --color-muted-foreground: var(--muted-foreground);
+  --color-muted-strong: var(--muted-strong);
   --color-accent: var(--accent);
   --color-accent-foreground: var(--accent-foreground);
   --color-destructive: var(--destructive);
@@ -166,4 +192,128 @@
   [aria-label="Token 总览"] {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
+}
+
+/* ---------------------------------------------------------------------------
+   备注标签（chip-note）
+   
+   为什么单独一个 class 而不是写 Tailwind 任意值：这里要的三组颜色都基于
+   `color-mix(in oklab, var(--info) N%, ...)`，写在 class 里比塞进 `[]` 任意值
+   更可靠、可读，也能一次性覆盖暗色（token 已按主题定义，无需再写 dark: 变体）。
+   
+   语义：**备注是用户自己写的内容**，此前用的是与「国服」等自动状态相同的灰色，
+   导致「一眼认出这是谁的号」这个用途失效（所有者反馈「备注是不是不太明显」）。
+   改用信息蓝后，蓝＝你写的 / 绿＝系统状态，一眼可分。
+   --------------------------------------------------------------------------- */
+.chip-note {
+  background: color-mix(in oklab, var(--info) 13%, transparent);
+  border-color: color-mix(in oklab, var(--info) 30%, transparent);
+  color: color-mix(in oklab, var(--info) 72%, black);
+  font-weight: 500;
+}
+.dark .chip-note {
+  /* 暗色下不能再用「混黑」压暗（深底会糊掉），改为向白提亮。 */
+  color: color-mix(in oklab, var(--info) 82%, white);
+}
+
+/* ---------------------------------------------------------------------------
+   账号池「模型冷却」角标（.pool-mbadge）
+   
+   为什么单独一个 class：这里的三组颜色同样基于 `color-mix(in oklab, …)`，
+   与 chip-note 同一套写法；而它还必须带 `cursor: help` —— 这个角标**唯一**的
+   交互就是悬浮，光标不给提示的话没人会去悬停，那提示就等于没做。
+   
+   与 .chip-note 的语义区分：蓝 = 用户写的备注，琥珀 = 系统层面的限流告警。
+   --------------------------------------------------------------------------- */
+.pool-mbadge {
+  cursor: help;
+  background: color-mix(in oklab, var(--warning) 16%, transparent);
+  border-color: color-mix(in oklab, var(--warning) 36%, transparent);
+  color: color-mix(in oklab, var(--warning) 62%, black);
+}
+.dark .pool-mbadge {
+  /* 暗色下同样是「混黑会糊」，改为提亮。 */
+  color: color-mix(in oklab, var(--warning) 82%, white);
+}
+
+/* ---------------------------------------------------------------------------
+   账号池「使用中」标记（.pool-inuse / .pool-row-inuse）
+
+   语义：该账号**此刻有在途请求**（`in_flight > 0`），即流量正落在它身上。
+   这是「活跃度」，与状态列的「健康 / 排队中 / 冷却中」回答的「可用性」是两个维度，
+   所以用**蓝色**（--info）而不是绿/琥珀/红 —— 那三色在本页已被
+   「健康 / 冷却 / 禁用」占用，再借用会让「这是不是一种故障」产生歧义。
+
+   与 .chip-note 的语义区分（两处都用蓝）：
+     · .chip-note  = **用户自己写的**备注（静态内容，不会变）
+     · .pool-inuse = **系统实时状态**（会闪、会消失）
+   靠脉冲动画把「实时」这一层表达出来，两者不会混。
+
+   为什么写成 class 而不是 Tailwind 任意值：与 chip-note / pool-mbadge 同一套写法。
+   `color-mix(in oklab, …)` 塞进 `bg-[…]` 里既难读、又容易在构建时被转义处理坏
+   （本文件上方 chip-note 的注释已记录过这个取舍）。
+   --------------------------------------------------------------------------- */
+.pool-inuse {
+  display: inline-flex;
+  align-items: center;
+  background: color-mix(in oklab, var(--info) 14%, transparent);
+  border-color: color-mix(in oklab, var(--info) 40%, transparent);
+  color: color-mix(in oklab, var(--info) 72%, black);
+}
+.dark .pool-inuse {
+  /* 暗色下「混黑会糊」，改为提亮（与 chip-note / pool-mbadge 同一处理）。 */
+  color: color-mix(in oklab, var(--info) 80%, white);
+}
+
+/* 脉冲圆点：把「实时」这一层表达出来（静态徽标会被当成又一个标签）。 */
+.pool-inuse-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: currentColor;
+  flex: none;
+  animation: pool-inuse-pulse 1.6s ease-out infinite;
+}
+
+@keyframes pool-inuse-pulse {
+  0% {
+    box-shadow: 0 0 0 0 color-mix(in oklab, var(--info) 55%, transparent);
+  }
+  70% {
+    box-shadow: 0 0 0 6px transparent;
+  }
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+  }
+}
+
+/* 尊重「减少动态效果」偏好：脉冲是纯装饰，关掉不影响信息（文字与色条仍在）。 */
+@media (prefers-reduced-motion: reduce) {
+  .pool-inuse-dot {
+    animation: none;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+   正在使用的那一行：极淡蓝底 + 左侧 3px 蓝竖条
+
+   为什么用 `box-shadow: inset` 而不是 `border-left`：加真边框会把该行内容
+   整体右移 3px，与未使用的行错位 —— 扫视对比时反而更容易看歪。
+   inset 阴影画在单元格内部，不参与布局。
+
+   为什么需要它（而不只靠状态列的徽标）：状态列里还挤着「健康」「排队中」
+   「冷却中 429 · 42s」「⚠ N 模型」一堆彩色标签，徽标混在里面不显眼；
+   色条占用的是**行的空白边缘**，不跟任何标签抢注意力，且窗口横向滚动时
+   行左边缘**永远在视野内**（状态列可能不在）。两者分工：扫视靠色条、读细节靠徽标。
+   --------------------------------------------------------------------------- */
+.pool-row-inuse > td:first-child {
+  box-shadow: inset 3px 0 0 0 var(--info);
+}
+.pool-row-inuse {
+  background: color-mix(in oklab, var(--info) 5%, transparent);
+}
+/* 展开态与「使用中」同时成立时，展开色不该被行底色盖掉 —— 用更高的选择器优先级
+   把两者叠起来（外圈仍是展开的 primary 基调，左侧蓝条保留）。 */
+.pool-row-inuse.pool-row-expanded {
+  background: color-mix(in oklab, var(--info) 7%, transparent);
 }

@@ -120,6 +120,14 @@ type entry struct {
 	// cands[0] —— 100 并发下实测 91/100 全部撞同一个账号（惊群）。
 	// 序号由 Pool 在持锁下自增，因此「平局时先选中者优先」= 严格的 LRU 顺序。
 	lastUsedSeq int64
+	// sessionDeadFails 连续 ErrSessionDead（12153）计数，达到阈值才禁用。
+	//
+	// 为什么需要它：12153 会被**临时性**触发（网络抖动 / 上游闪断 / refresh 竞态），
+	// 旧行为一次即 Disable，把健康账号永久杀掉 —— 实测发现一批 disabled 账号
+	// 其实 refresh 完全正常，是历史误判的受害者。
+	// 改为「连续 N 次才禁用」后，偶发失败不会杀号；
+	// 任何证明账号未死的时刻（refresh 成功 / chat 成功 / 手工复活）都清零。
+	sessionDeadFails int
 
 	// breakerUntil / fails / retryCount 为熔断器运行态（不持久化）。
 	// fails 是唯一的"连续失败"计数器：任何错误喂入，达到 breakerThreshold 触发熔断（指数退避），
@@ -1466,6 +1474,69 @@ func (p *Pool) Disable(uid, reason string) {
 	}
 }
 
+// sessionDeadThreshold 连续 ErrSessionDead（12153）达到该次数才永久禁用。
+//
+// 取 3 的理由：12153 会被临时性触发（网络抖动 / 上游闪断 / refresh 竞态），
+// 单次即杀号会误杀健康账号。连续 3 次（跨多次保活周期）才认为是真的 session 死亡。
+const sessionDeadThreshold = 3
+
+// sessionDeadReason 禁用原因（与旧文案保持一致，便于既有运维脚本匹配）。
+const sessionDeadReason = "12153 session dead"
+
+// SessionDeadThreshold 暴露阈值（供 scheduler 日志 / 运维文档引用）。
+func SessionDeadThreshold() int { return sessionDeadThreshold }
+
+// NoteSessionDead 记录一次 ErrSessionDead（12153）——**不立即禁用**。
+//
+// 旧行为是「一次 12153 即 Disable」，但该错误会被临时性触发（网络抖动 /
+// 上游闪断 / refresh 竞态），一次失败就永久杀号会误杀健康账号 ——
+// 实测发现一批 disabled 账号其实 refresh 完全正常，是历史误判的受害者。
+//
+// 现改为连续 sessionDeadThreshold 次才禁用：计数 +1，达阈值则 Disable 并清计数。
+// 返回 true 表示本次已达阈值并完成禁用。
+//
+// 清零时机见 ClearSessionDead（refresh 成功 / chat 成功 / 手工复活）。
+func (p *Pool) NoteSessionDead(uid string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	e.sessionDeadFails++
+	p.dirty.Store(true)
+	if e.sessionDeadFails < sessionDeadThreshold {
+		return false
+	}
+	e.sessionDeadFails = 0
+	e.disabled = true
+	e.reason = sessionDeadReason
+	return true
+}
+
+// ClearSessionDead 清零连续 12153 计数。
+//
+// 任何「证明账号没死」的时刻都应调用它：refresh 成功、chat 成功、手工复活。
+// 不清零的话，一个月的偶发抖动累计到 3 次照样会杀号 —— 而「连续」正是本修复
+// 的语义核心，累计计数会让它退化成「累计 3 次即杀」。
+func (p *Pool) ClearSessionDead(uid string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byUID[uid]; ok {
+		e.sessionDeadFails = 0
+	}
+}
+
+// SessionDeadFails 当前连续 12153 计数（供 scheduler 日志与测试断言）。
+func (p *Pool) SessionDeadFails(uid string) int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if e, ok := p.byUID[uid]; ok {
+		return e.sessionDeadFails
+	}
+	return 0
+}
+
 // reviveCoolingLocked 只清冷却（until/coolKind/reason）并更新 credits，不动熔断器
 // （fails/retryCount/breakerUntil）。签到解冻走这里：签到成功只证明余额恢复与
 // billing 通道健康，不证明 chat 通道健康，熔断（连续 5xx 信号）不应被签到覆盖。
@@ -1516,6 +1587,10 @@ func (p *Pool) NoteSuccess(uid string) {
 		e.fails = 0
 		e.retryCount = 0
 		e.breakerUntil = time.Time{}
+		// 一次 chat 成功就证明 session 没死，连续 12153 计数必须清零：
+		// 不清零的话，一个月的偶发抖动会累计到阈值照样杀号 ——
+		// 而「连续」正是该修复的语义核心，累计计数会让它退化成「累计 N 次即杀」。
+		e.sessionDeadFails = 0
 		p.dirty.Store(true)
 	}
 }

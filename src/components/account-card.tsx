@@ -1,5 +1,5 @@
-import { ArrowRight, Cat, Check, CircleCheck, Clock3, Coins, Copy, Ellipsis, Globe, Info, Loader2, PencilLine, PlaneTakeoff, RefreshCw, Save, Sparkles, Star, Trash2 } from "lucide-react";
-import { useState } from "react";
+import { ArrowRight, Ban, CalendarCheck, Cat, Check, CircleCheck, Clock3, Coins, Copy, Ellipsis, Gift, Globe, GraduationCap, History, Info, Loader2, Moon, PencilLine, PlaneTakeoff, RefreshCw, Save, Sparkles, Star, Trash2, Zap } from "lucide-react";
+import { useState, type ReactNode } from "react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
@@ -13,14 +13,16 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { CodeBuddyCnIdeMark, CodeBuddyMark, WorkBuddyMark } from "@/components/product-marks";
 import * as api from "@/lib/api";
+import { accountReloginAlarm } from "@/lib/account-expiry";
 import { cn } from "@/lib/utils";
+import { AccountRecordsView } from "@/components/account-records-view";
 import { demoModeEnabled } from "@/lib/demo-mode";
-import type { AccountMeta, CreditExpiry, CreditResource, TravelStatus } from "@/lib/types";
+import type { AccountMeta, AccountRunningTask, CreditExpiry, CreditResource, GatewayTaskName, TravelStatus } from "@/lib/types";
 
 const AVATAR_TONES = [
   "bg-emerald-100 text-emerald-800",
@@ -126,6 +128,23 @@ function accountDetailRows(account: AccountMeta): [string, string, string?][] {
 }
 
 const chipClass = "rounded-md px-1.5 py-0 text-[11px] font-medium";
+
+/**
+ * 「本轮已跑」标记的悬停说明。
+ *
+ * 为什么必须解释进度口径：`processed` 是**下界** —— Go 侧记录只在「成功且有新
+ * 变化 / 失败 / 重要跳过」时写，且按天去重（`records.TaskDaily`），所以一轮里
+ * 没有新变化的账号不会留下记录。不说明的话，用户看到「3/14」长时间不动会
+ * 以为卡死了，而那其实是正常现象（Rust 侧 `task_processed_ids` 与设置页
+ * `TaskRunningPanel` 都对此有明确警告，这里保持同一口径）。
+ */
+function runningTaskTitle(task: AccountRunningTask): string {
+  const progress =
+    task.total && task.total > 0
+      ? `本轮进度：已记录 ${task.processed ?? 0} / ${task.total} 个账号（近似值，无新变化的账号不写记录，数字可能停住不动）。`
+      : "本轮进度暂不可用。";
+  return `本账号已参与「${task.label}」本轮任务。${progress}点开右上角菜单可单独运行本账号的养护任务。`;
+}
 
 function travelIconChip({
   label,
@@ -267,15 +286,316 @@ function regionChip(account: AccountMeta) {
   );
 }
 
+/**
+ * 账号菜单里「养护任务」这一组的适用性判定。
+ *
+ * 为什么需要它：菜单此前只列了刷新 Token / 签到 / 领养三项，而项目里还有活跃上报、
+ * 夜猫子、开学季、国际版 trial 等养号动作；更要紧的是**这些动作并非对所有账号都成立**
+ * —— 国际版没有签到与任务中心，夜猫子只在 23:00–08:00 计入，开学季是限时活动。
+ * 菜单若照列不误，用户点下去只会得到一次无意义的失败请求，且不知道原因。
+ *
+ * 判定依据**取自后端真实门槛**，不是前端猜的：
+ *   - 区域：`config.rs::account_supported_by_auto_tasks`（`Region::of(account) == Cn`），
+ *     域名以 `.ai` 结尾即国际版；`travel.rs::accounts_in_scope` 与
+ *     `checkin.rs::accounts_in_scope` 都用它。
+ *   - 夜猫子时段：`nightowl.go` 的 `nightWindowStartHour/EndHour`（23:00–08:00 CST）。
+ *   - 签到状态：`checkin.rs::checkin_account` 返回的 `result: "already"`。
+ */
+type TaskAvailability = {
+  /** false = 置灰：该动作对此账号不成立。 */
+  enabled: boolean;
+  /**
+   * 置灰原因；启用时为 null。
+   *
+   * 渲染成菜单项下方的第二行小字，并同时进 `title` 与 `aria-label`
+   * （形如「手动签到（不可用：国际版没有签到接口，上游返回空数据）」）——
+   * 同一句话三处复用，视觉、悬停、读屏各取所需，不必维护多份文案。
+   */
+  reason: string | null;
+};
+
+/** 账号是否为国际版。只认 regionKey；它缺失时回退到域名后缀（与后端口径一致）。 */
+function isIntlAccount(account: AccountMeta): boolean {
+  if (account.regionKey) return account.regionKey === "intl";
+  return (account.domain ?? "").trim().toLowerCase().endsWith(".ai");
+}
+
+/** 当前是否处于夜猫时段（23:00–08:00 CST），与 Go 侧 `withinNightWindow` 同口径。 */
+function withinNightWindow(now = new Date()): boolean {
+  // 用 UTC+8 固定偏移换算，不依赖本机时区：窗口定义来自上游活动规则，
+  // 换台机器不应改变判定（Go 侧同样刻意避开 tzdata）。
+  const cstHour = (now.getUTCHours() + 8) % 24;
+  return cstHour >= 23 || cstHour < 8;
+}
+
+/** 手动签到：仅国服；已签到时仍列出但置灰，避免菜单项凭空消失。 */
+function checkinAvailability(account: AccountMeta, todayCheckedIn?: boolean): TaskAvailability {
+  if (isIntlAccount(account)) {
+    return { enabled: false, reason: "国际版没有签到接口，上游返回空数据" };
+  }
+  if (todayCheckedIn) {
+    return { enabled: false, reason: "今日已签到，明天再来" };
+  }
+  return { enabled: true, reason: null };
+}
+
+/** 领养 Buddy：国服才有猫猫旅行与 Buddy 体系。 */
+function adoptAvailability(account: AccountMeta): TaskAvailability {
+  if (isIntlAccount(account)) {
+    return { enabled: false, reason: "国际版没有 Buddy 领养入口" };
+  }
+  return { enabled: true, reason: null };
+}
+
+/**
+ * 活跃上报：只有国服 growth 接口有真实数据。
+ *
+ * 与签到的区别：这里**不**因「今日已跑」而置灰 —— 上报可重复执行（幂等，
+ * 且是连登的自检手段），没有「今日已做」这种终态。
+ */
+function activityAvailability(account: AccountMeta): TaskAvailability {
+  if (isIntlAccount(account)) {
+    return { enabled: false, reason: "国际版 growth 接口无数据，上报不会计入" };
+  }
+  return { enabled: true, reason: null };
+}
+
+/** 夜猫子：国服 + 仅在 23:00–08:00（北京时间）内由上游计入。 */
+function nightOwlAvailability(account: AccountMeta, now?: Date): TaskAvailability {
+  if (isIntlAccount(account)) {
+    return { enabled: false, reason: "国际版 growth 接口无数据，上报不会计入" };
+  }
+  if (!withinNightWindow(now)) {
+    return { enabled: false, reason: "仅 23:00–08:00（北京时间）计入，当前不在时段内" };
+  }
+  return { enabled: true, reason: null };
+}
+
+/**
+ * 开学季活动：国服限时活动（国际版返回 404），且活动下线后清单为空。
+ *
+ * 活动是否在期只有问上游才知道，前端**不猜**：这里只按区域置灰，
+ * 在期与否交给接口返回的中文说明（`school.go` 会写「活动不在期…」记录）。
+ */
+function schoolAvailability(account: AccountMeta): TaskAvailability {
+  if (isIntlAccount(account)) {
+    return { enabled: false, reason: "国际版无此活动（上游返回 404）" };
+  }
+  return { enabled: true, reason: null };
+}
+
+/** 国际版 trial 加油包：与其它任务相反，**只对国际版**成立。 */
+function trialAvailability(account: AccountMeta): TaskAvailability {
+  if (!isIntlAccount(account)) {
+    return { enabled: false, reason: "国际版专享，国服无此端点" };
+  }
+  return { enabled: true, reason: null };
+}
+
+/**
+ * 这个账号**有没有 Buddy**——菜单文案要回答的真正问题。
+ *
+ * 为什么不能直接读 `travelStatus.label`：那个标签回答的是「**今天旅行到哪一步**」，
+ * 与「有没有猫」是两件事，而 `TravelStatusLabel` 里只有 2 个值能证明没猫。
+ * 逐个对照后端 `travel.rs::display_label`（唯一出处）：
+ *
+ * | label | 后端判定 | 关于 Buddy 能推出什么 |
+ * |---|---|---|
+ * | `adopted` | `skip=="adopted"`（领养成功） | **有**（刚领到） |
+ * | `traveling` | `ok && !claimed`（已派出） | **有**（没猫派不出去） |
+ * | `finished` | `same_day && claimed`（含 daily-limit） | **有**（今天派过猫） |
+ * | `no-buddy` | `skip=="no-buddy"`（领养失败） | 没（今日记录） |
+ * | `adopt-threshold` | `skip=="adopt-threshold"`（轮次不够） | 没（今日记录） |
+ * | `untraveled` | 其余全部 | **不知道** |
+ *
+ * 关键在最后一行。`untraveled` 是 `display_label` 的兜底分支，它同时覆盖
+ * 「从来没有记录」「记录是昨天的」「查询报错（status-error / config-error /
+ * location-unavailable / claim-error）」——这些都**不能**推出没有猫。
+ * 尤其 `roll_cache_to_today` 跨日时只保留在途记录（`result_in_flight`），
+ * 于是**每个有猫的账号在第二天都会退化成 `untraveled`**：昨天领的猫、
+ * 昨天派完的猫，记录全被丢掉。此前界面正是在这里出错 —— 把 `untraveled`
+ * 当成「没有 Buddy」，于是一个养了几个月猫的账号在新的一天里又显示
+ * 「领养 Buddy」。
+ *
+ * `travelStatus === undefined` 同样是「不知道」，且它有三种成因（仍在查询 /
+ * 查询失败 / 国际版根本不查 —— `AccountsPage.accountsInScope` 只查国服），
+ * 三者都不该被当成「断言没有猫」。
+ *
+ * 结论：只有 `no-buddy` / `adopt-threshold` 敢说没有；`untraveled` 与
+ * undefined 一律按「未知」处理，界面保守表述。
+ */
+type BuddyKnowledge = "has" | "none" | "unknown";
+
+function buddyKnowledge(status: TravelStatus | undefined): BuddyKnowledge {
+  if (!status) return "unknown";
+  // skip 优先于 label：它是后端给的原值，而 label 是它的有损投影
+  //（例如 has-buddy 与 adopted 都会落成「有」）。两处都认，任一条成立即可。
+  if (status.skip === "has-buddy" || status.skip === "adopted" || status.skip === "daily-limit") {
+    return "has";
+  }
+  if (status.skip === "no-buddy" || status.skip === "adopt-threshold") {
+    return "none";
+  }
+  switch (status.label) {
+    case "adopted":
+    case "traveling":
+    case "finished":
+      return "has";
+    case "no-buddy":
+    case "adopt-threshold":
+      return "none";
+    default:
+      return "unknown";
+  }
+}
+
+/**
+ * 领养菜单项的文案。三态各有明确措辞，**未知态绝不断言**：
+ *
+ *   - `has`     → 「重新检查 Buddy」
+ *   - `none`    → 「领养 Buddy」（有依据，可以放心点）
+ *   - `unknown` → 「检查 / 领养 Buddy」
+ *
+ * 未知态为什么是「检查 / 领养」而不是「领养 Buddy（状态未知）」：菜单项的第一行
+ * 是用户扫视时的动作标识，把「领养」摆在最前面，对于一个**可能已经有猫**的账号
+ * 仍然是误导 —— 只是把误导从「断言」降级成了「暗示」。改成动词中性的
+ * 「检查 / 领养」，说的正是后端 `adopt_for_account` 的真实行为：它先
+ * `fetch_has_buddy`，已有猫就直接返回 `has-buddy`（**不做任何写操作**），
+ * 没有才领养。文案与行为因此严格对应。
+ *
+ * 「状态未知」这件事本身放在第二行小字里（见 `adoptMenuHint`）说清楚：第一行
+ * 要短且稳定，第二行才适合承载解释。
+ */
+function adoptMenuLabel(knowledge: BuddyKnowledge): string {
+  if (knowledge === "has") return "重新检查 Buddy";
+  if (knowledge === "none") return "领养 Buddy";
+  return "检查 / 领养 Buddy";
+}
+
+/**
+ * 领养项的悬停说明：把「我们现在知道什么」说清楚，把**后端原话**带上。
+ *
+ * 来源优先级：`message`（后端 `display_record` 透出的具体原因，如
+ * 「无 Buddy（领养需先积累对话轮次）」）> 本地按状态生成的兜底说明。
+ * 后端有话说时一律以后端为准 —— 它才知道真实原因，本地只能反推。
+ */
+function adoptMenuHint(status: TravelStatus | undefined, knowledge: BuddyKnowledge): string | undefined {
+  const backendMessage = status?.message?.trim();
+  if (backendMessage) return backendMessage;
+  if (knowledge === "has") {
+    return "该账号已有 Buddy（今天已派出过或刚领养），点这里会重新查询一次";
+  }
+  if (knowledge === "unknown") {
+    // 三种成因分开讲：用户据此判断「要不要等一等再点」。
+    return status
+      ? "该账号今天没有查到 Buddy 记录（本轮巡检可能未覆盖，或查询失败），不能据此断定它没有猫；点这里会先查询、没有才领养"
+      : "Buddy 状态尚未查询完成（或该账号不在旅行巡检范围内），不能据此断定它没有猫；点这里会先查询、没有才领养";
+  }
+  return undefined;
+}
+
+/** 刷新 Token：两个区域都需要，不受区域限制。 */
+function refreshTokenAvailability(): TaskAvailability {
+  return { enabled: true, reason: null };
+}
+
+/**
+ * 渲染一个养护任务菜单项。
+ *
+ * 置灰项与可点项**渲染成同一个组件**（只是换文案与 aria 属性），原因：
+ *   - 需求要求「不显示或置灰给提示」，两者混用会让菜单长度随账号类型跳变；
+ *   - 置灰项一定要把原因说出来 —— 只置灰不解释，用户会当成 bug（这正是
+ *     所有者反馈的痛点）。原因既写进可见文案，也写进 title 与 aria-label。
+ */
+function careTaskItem({
+  icon,
+  label,
+  availability,
+  onSelect,
+  disabled,
+  busy,
+  hint,
+}: {
+  icon: ReactNode;
+  label: string;
+  availability: TaskAvailability;
+  onSelect: () => void;
+  /** 卡片级的统一禁用（如 featuresDisabled / 父级未接线）。 */
+  disabled?: boolean;
+  /** 该项正在执行中，临时不可点但**不**算「不适用」。 */
+  busy?: boolean;
+  /**
+   * 可点项的补充说明（第二行小字）。
+   *
+   * 与 `availability.reason` 的分工：那个解释「为什么点不了」，这个在**能点**的
+   * 情况下补充「点下去会发生什么 / 我们目前知道什么」。两者都渲染在第二行，
+   * 因为位置上它们从不同时出现（不可用时只讲原因，可用时才轮到提示）。
+   */
+  hint?: string;
+}) {
+  const blocked = disabled || !availability.enabled || busy;
+  // 「执行中」与「不适用」是两种不同的置灰：前者是暂时的，必须说清楚，
+  // 否则用户看到灰项会以为这个号不支持该任务。
+  const reason = busy ? "正在执行，请稍候…" : availability.reason;
+  // 第二行的唯一出处：不可用讲原因，可用讲提示。共用一行避免菜单项高度乱跳。
+  const secondLine = reason ?? hint ?? null;
+  return (
+    <DropdownMenuItem
+      className="items-start"
+      disabled={blocked}
+      title={reason ?? hint ?? undefined}
+      // aria-label 让读屏软件也读到原因，而不是只有视觉上的灰。
+      aria-label={reason ? `${label}（不可用：${reason}）` : label}
+      aria-disabled={blocked}
+      onSelect={onSelect}
+    >
+      <span className="mt-0.5 flex shrink-0">{icon}</span>
+      <span className="min-w-0 flex-1">
+        <span className="block truncate">{label}</span>
+        {secondLine ? (
+          <span className="mt-0.5 block whitespace-normal text-[11px] leading-4 text-muted-foreground">
+            {secondLine}
+          </span>
+        ) : null}
+      </span>
+    </DropdownMenuItem>
+  );
+}
+
 interface Props {
   account: AccountMeta;
   onDelete: (a: AccountMeta) => void;
   /** 备注保存成功后触发，供父级重新拉取账号列表（卡片自身不持有列表状态）。 */
   onNoteSaved?: () => void;
+  /**
+   * 切换账号的禁用状态。
+   *
+   * 禁用 = 不进网关账号池；签到 / 旅行 / 领奖等养号任务照跑。
+   * 由父级实现（需要提示、刷新列表），卡片只负责触发。
+   */
+  onToggleDisabled?: (a: AccountMeta) => void;
   onCheckin?: (a: AccountMeta) => void;
   onRefresh?: (a: AccountMeta) => void;
   /** 领养 Buddy（仅领养，不派猫；与「一键旅行」的重叠部分单独暴露出来） */
   onAdopt?: (a: AccountMeta) => void;
+  /**
+   * 手动触发一轮养号任务（活跃上报 / 夜猫子 / 开学季 / trial）。
+   *
+   * 注意语义：这是**整轮**触发，作用于全部账号，不是只跑当前卡片这个号
+   *（Go 侧 `RunTaskByName` 遍历账号池）。菜单用分组标题把这一点说清楚。
+   */
+  onRunTask?: (task: GatewayTaskName) => void;
+  /** 正在执行的任务名；用于临时置灰并避免重复触发。 */
+  taskRunning?: GatewayTaskName;
+  /**
+   * 本账号参与了**正在跑的那一轮**养号任务时下发的标记；否则为 null/undefined。
+   *
+   * 由父级按 `taskRuntime.processedIds.includes(account.id)` 判定 —— 注意是
+   * **账号库 id**，不是网关 uid（两者在真实数据里不同，用 uid 会一个都对不上
+   * 且不会报错）。不在本轮范围内的账号（区域不符 / 已禁用 / 需重登）由后端
+   * 的 `total` 口径排除，父级因此也不会给它标记 —— 否则用户会以为所有号都在跑。
+   */
+  runningTask?: AccountRunningTask | null;
   onSwitch?: (a: AccountMeta) => void;
   todayCheckedIn?: boolean;
   /** 今日旅行状态（undefined=查询中/未知，不渲染标签） */
@@ -333,7 +653,7 @@ function ProductCurrentState({ product, compact = false }: { product: "workbuddy
   );
 }
 
-export function AccountCard({ account, onDelete, onNoteSaved, onCheckin, onRefresh, onAdopt, onSwitch, todayCheckedIn, travelStatus, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, featuresDisabled = true, compact = false }: Props) {
+export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, onCheckin, onRefresh, onAdopt, onRunTask, taskRunning, runningTask, onSwitch, todayCheckedIn, travelStatus, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, featuresDisabled = true, compact = false }: Props) {
   const [resourcesOpen, setResourcesOpen] = useState(false);
   /** 备注编辑弹窗；`noteDraft` 是受控输入（打开时用当前备注初始化）。 */
   const [noteOpen, setNoteOpen] = useState(false);
@@ -341,8 +661,12 @@ export function AccountCard({ account, onDelete, onNoteSaved, onCheckin, onRefre
   const [noteSaving, setNoteSaving] = useState(false);
   /** 账号详情弹窗：展示本地记录里能看出「这是谁的号」的全部字段。 */
   const [detailOpen, setDetailOpen] = useState(false);
+  /** 账号记录弹窗：任务 / 积分 / Token 三类事件，带日期筛选。 */
+  const [recordsOpen, setRecordsOpen] = useState(false);
   const name = account.nickname || account.uid || "未命名账号";
-  const expired = typeof account.expiresAt === "number" && account.expiresAt < Date.now();
+  /** 需重新登录时的报警内容；账号仍能自愈（access token 过期）时为 null。
+   *  判定口径集中在 `@/lib/account-expiry`，与兼容网关页共用同一套。 */
+  const reloginAlarm = accountReloginAlarm(account);
   const avatarClass = avatarTone(name);
   const resources = creditResources(credit);
   const visibleResources = resources.slice(0, 2);
@@ -377,10 +701,54 @@ export function AccountCard({ account, onDelete, onNoteSaved, onCheckin, onRefre
 
   const statusChips = (
     <>
+      {/* 禁用标记放在最前：它是「这个号当前不接流量」的最强信号，
+          比备注/区域等描述性标签更需要一眼看到。 */}
+      {account.disabled ? (
+        <Badge
+          variant="outline"
+          className={cn(chipClass, "gap-1 border-destructive/40 text-destructive")}
+          title="已禁用：不进入网关账号池（签到等养号任务仍在运行）"
+        >
+          <Ban className="size-3 shrink-0" />
+          已禁用
+        </Badge>
+      ) : null}
+      {/* 「本账号已参与本轮任务」标记。紧跟在「已禁用」之后、描述性标签（备注/区域/
+          签到）**之前**：它是秒级出现又消失的实时状态，而其余标签都是账号的稳定属性。
+          刻意**不**排到「已禁用」前面 —— 那条标签的注释已写明「放最前」的既有约定，
+          这里不去推翻它（两者可以并存：禁用的号照跑养号任务）。
+          措辞用「本轮已跑」而不是「正在跑」：后端只给 `processedIds`（**已留下
+          记录**的账号），Go 侧记录是在处理完一个账号之后才写，因此本轮正在处理的
+          那个号还没进集合，后端也没有「当前是哪个号」这个字段。照实说「已跑」，
+          不编造一个后端并不提供的状态（详见 types.ts 的 AccountRunningTask）。 */}
+      {runningTask && (
+        <Badge
+          variant="success"
+          className={cn(chipClass, "max-w-[12rem] gap-1")}
+          aria-label={`本账号本轮已跑：${runningTask.label}`}
+          title={runningTaskTitle(runningTask)}
+        >
+          {/* 转圈图标暗示「任务仍在进行」，让静态文字带上时间感 */}
+          <Loader2 className="size-3 shrink-0 animate-spin" />
+          <span className="truncate">本轮已跑 · {runningTask.label}</span>
+        </Badge>
+      )}
       {/* 备注放在最前面：它是用户自己起的标签，正是用来「一眼认出这是谁的号」的，
-          排在区域/签到等自动状态之前才符合使用意图。 */}
+          排在区域/签到等自动状态之前才符合使用意图。
+          
+          用 chip-note（信息蓝）而不是默认的灰：灰色与「国服」这类自动状态同色，
+          备注反而看不出是「我自己写的东西」（所有者反馈过不够明显）。
+          蓝＝用户写的 / 绿＝系统状态，一眼可分。
+          
+          宽度上限：宽松 12rem，紧凑收到 7.5rem（120px）——紧凑列宽只有约 300px，
+          而头部一行的「不可压缩」需求算下来已超 452px（详见下方 compact 头部注释），
+          备注若不收窄会把三个产品按钮挤出可视区。超出部分省略号 + 悬停看全文。 */}
       {account.note ? (
-        <Badge variant="outline" className={cn(chipClass, "max-w-[12rem] gap-1")} title={`备注：${account.note}`}>
+        <Badge
+          variant="outline"
+          className={cn(chipClass, "chip-note gap-1", compact ? "max-w-[7.5rem]" : "max-w-[12rem]")}
+          title={`备注：${account.note}`}
+        >
           <PencilLine className="size-3 shrink-0" />
           <span className="truncate">{account.note}</span>
         </Badge>
@@ -390,7 +758,13 @@ export function AccountCard({ account, onDelete, onNoteSaved, onCheckin, onRefre
         <Badge variant={todayCheckedIn ? "success" : "secondary"} className={cn(chipClass, !todayCheckedIn && "text-muted-foreground")}><CircleCheck /> {todayCheckedIn ? "已签到" : "未签到"}</Badge>
       )}
       {travelChip(travelStatus)}
-      {(account.needsRelogin || expired) && <Badge variant="warning" className={chipClass}>{account.needsRelogin ? "需重新登录" : "Token 已过期"}</Badge>}
+      {/* 只在**无法自愈**时才报警：access token 过期会自动刷新，不该打扰用户；
+          真要人工介入的只有「上游拒绝」与「refresh token 也过期」两种。 */}
+      {reloginAlarm && (
+        <Badge variant="warning" className={chipClass} title={reloginAlarm.title}>
+          {reloginAlarm.label}
+        </Badge>
+      )}
       {creditPriority && (
         <Tooltip>
           <TooltipTrigger asChild>
@@ -407,7 +781,10 @@ export function AccountCard({ account, onDelete, onNoteSaved, onCheckin, onRefre
 
   return (
     <TooltipProvider>
-      <article className="flex min-w-0 flex-col overflow-hidden rounded-2xl border border-border bg-card shadow-[0_1px_2px_rgba(15,23,42,.025),0_10px_28px_rgba(15,23,42,.035)] transition-shadow hover:shadow-[0_2px_4px_rgba(15,23,42,.04),0_14px_34px_rgba(15,23,42,.055)]">
+      {/* h-full：撑满栅格行高。配合父级 grid 的 auto-rows-fr，让同一排的卡片
+          无论有几个积分包都等高（详情区是 flex-1，多余空间落在底部，
+          底部操作栏因此始终对齐）。 */}
+      <article className="flex h-full min-w-0 flex-col overflow-hidden rounded-2xl border border-border bg-card shadow-[0_1px_2px_rgba(15,23,42,.025),0_10px_28px_rgba(15,23,42,.035)] transition-shadow hover:shadow-[0_2px_4px_rgba(15,23,42,.04),0_14px_34px_rgba(15,23,42,.055)]">
       <header
         className={cn(
           "relative flex items-center border-b border-border",
@@ -435,7 +812,10 @@ export function AccountCard({ account, onDelete, onNoteSaved, onCheckin, onRefre
           )}
         </div>
 
-        <div className={cn("absolute z-20", compact ? "right-2.5 top-1/2 -translate-y-1/2" : "right-3.5 top-3.5")}>
+        {/* ⋯ 按钮的位置：紧凑头部改成两行后不能再垂直居中（会落在两行之间、
+            与产品图标不在同一水平线）。改为贴第一行中心：header py-1.5(6px) +
+            产品图标 28px 的一半(14px) ⇒ 约 20px。宽松模式仍贴右上角。 */}
+        <div className={cn("absolute z-20", compact ? "right-2.5 top-5" : "right-3.5 top-3.5")}>
           {demoModeEnabled ? (
             <DemoAction>
               <Button variant="ghost" size="icon" className={cn("rounded-lg text-muted-foreground hover:text-foreground", compact ? "size-7" : "size-8")} aria-label={`管理账号 ${name}`} title="更多账号操作">
@@ -449,25 +829,81 @@ export function AccountCard({ account, onDelete, onNoteSaved, onCheckin, onRefre
                   <Ellipsis />
                 </Button>
               </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" className="w-40">
-                <DropdownMenuItem disabled={featuresDisabled || !onRefresh} onSelect={() => onRefresh?.(account)}>
-                  <RefreshCw />刷新 Token
-                </DropdownMenuItem>
-                {todayCheckedIn === false && (
-                  <DropdownMenuItem disabled={featuresDisabled || !onCheckin} onSelect={() => onCheckin?.(account)}>
-                    <CircleCheck />手动签到
-                  </DropdownMenuItem>
-                )}
-                {/* 领养：措辞随已知状态变化，避免用户点了才发现"已经有猫"或"还不够轮次"。
-                    「旅行巡检也会顺带领养」这点保留在菜单里说清，因为一键旅行确实覆盖它。 */}
-                <DropdownMenuItem disabled={featuresDisabled || !onAdopt} onSelect={() => onAdopt?.(account)}>
-                  <Cat />
-                  {travelStatus?.label === "adopted"
-                    ? "重新检查 Buddy"
-                    : travelStatus?.label === "adopt-threshold"
-                      ? "领养 Buddy（需先攒对话）"
-                      : "领养 Buddy"}
-                </DropdownMenuItem>
+              <DropdownMenuContent align="end" className="w-64">
+                {/* 「本账号」组：每一项都只作用于这张卡片的账号。
+                    标题不可省 —— 下面还有一组是整轮触发，混在一起会被误读。 */}
+                <DropdownMenuLabel>本账号养护</DropdownMenuLabel>
+                {careTaskItem({
+                  icon: <RefreshCw />,
+                  label: "刷新 Token",
+                  availability: refreshTokenAvailability(),
+                  onSelect: () => onRefresh?.(account),
+                  disabled: featuresDisabled || !onRefresh,
+                })}
+                {/* 签到：国际版不适用 → 置灰说明原因；今日已签到 → 置灰但**保留**该项。
+                    此前是 `todayCheckedIn === false &&` 条件渲染，已签到时整项消失，
+                    用户会以为功能没了（详见报告的设计取舍）。 */}
+                {careTaskItem({
+                  icon: todayCheckedIn ? <CircleCheck /> : <CalendarCheck />,
+                  label: todayCheckedIn ? "手动签到（今日已完成）" : "手动签到",
+                  availability: checkinAvailability(account, todayCheckedIn),
+                  onSelect: () => onCheckin?.(account),
+                  disabled: featuresDisabled || !onCheckin,
+                })}
+                {/* 领养：措辞随**已知的 Buddy 状态**变化，而不是随旅行状态变化。
+                    为什么不是直接读 travelStatus.label：见上方 buddyKnowledge 的
+                    完整对照表 —— `untraveled` 是后端兜底分支，跨日后有猫的账号
+                    也会落成它，把「尚未查询 / 今日无记录」当成「没有猫」正是
+                    所有者反馈的那个缺陷。未知态用「（状态未知）」如实说明，
+                    既不断言没有猫，也不假装已经有猫。
+                    「旅行巡检也会顺带领养」这点保留在菜单里说清，因为一键旅行
+                    确实覆盖它。 */}
+                {careTaskItem({
+                  icon: <Cat />,
+                  label: adoptMenuLabel(buddyKnowledge(travelStatus)),
+                  availability: adoptAvailability(account),
+                  onSelect: () => onAdopt?.(account),
+                  disabled: featuresDisabled || !onAdopt,
+                  hint: adoptMenuHint(travelStatus, buddyKnowledge(travelStatus)),
+                })}
+                {/* 以下 4 项是养号任务，均由网关（Go 侧）按账号区域过滤：
+                    活跃上报 / 夜猫子 / 开学季只跑国服，trial 只跑国际版。
+                    菜单项本身仍逐号列出 —— 目的是让用户看懂「这个号为什么不参与」，
+                    这一组的可点项触发的是**整轮**任务，故用分组标题明确边界。 */}
+                <DropdownMenuSeparator />
+                <DropdownMenuLabel>养号任务（触发一整轮，作用于全部账号）</DropdownMenuLabel>
+                {careTaskItem({
+                  icon: <Zap />,
+                  label: "活跃上报",
+                  availability: activityAvailability(account),
+                  onSelect: () => onRunTask?.("activity"),
+                  disabled: featuresDisabled || !onRunTask || taskRunning !== undefined,
+                  busy: taskRunning === "activity",
+                })}
+                {careTaskItem({
+                  icon: <Moon />,
+                  label: "夜猫子任务",
+                  availability: nightOwlAvailability(account),
+                  onSelect: () => onRunTask?.("nightowl"),
+                  disabled: featuresDisabled || !onRunTask || taskRunning !== undefined,
+                  busy: taskRunning === "nightowl",
+                })}
+                {careTaskItem({
+                  icon: <GraduationCap />,
+                  label: "开学季活动",
+                  availability: schoolAvailability(account),
+                  onSelect: () => onRunTask?.("school"),
+                  disabled: featuresDisabled || !onRunTask || taskRunning !== undefined,
+                  busy: taskRunning === "school",
+                })}
+                {careTaskItem({
+                  icon: <Gift />,
+                  label: "trial 加油包",
+                  availability: trialAvailability(account),
+                  onSelect: () => onRunTask?.("trial"),
+                  disabled: featuresDisabled || !onRunTask || taskRunning !== undefined,
+                  busy: taskRunning === "trial",
+                })}
                 <DropdownMenuSeparator />
                 {/* 备注：授权进来的账号常只带邮箱/手机号/随机 uid，看不出「这是谁的号」，
                     因此给一个自定义标签。文案随是否已有备注变化，避免用户以为要重填。 */}
@@ -479,6 +915,32 @@ export function AccountCard({ account, onDelete, onNoteSaved, onCheckin, onRefre
                   <Info />
                   查看账号详情
                 </DropdownMenuItem>
+                {/* 记录入口放在账号菜单里而不是单独一页：用户想知道「这个号昨天
+                    干了什么」时，视线就在这张卡片上，不该再去别处找。 */}
+                <DropdownMenuItem onSelect={() => setRecordsOpen(true)}>
+                  <History />
+                  查看记录
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                {/* 禁用/启用：禁用的只是「进网关账号池的资格」，
+                    签到等养号任务照跑，因此文案强调「不接流量」而非「停用账号」。 */}
+                <DropdownMenuItem
+                  onSelect={() => {
+                    onToggleDisabled?.(account);
+                  }}
+                >
+                  {account.disabled ? (
+                    <>
+                      <CircleCheck />
+                      启用（重新加入账号池）
+                    </>
+                  ) : (
+                    <>
+                      <Ban />
+                      禁用（不进入账号池）
+                    </>
+                  )}
+                </DropdownMenuItem>
                 <DropdownMenuSeparator />
                 <DropdownMenuItem className="text-destructive focus:bg-destructive/5 focus:text-destructive" onSelect={() => onDelete(account)}>
                   <Trash2 />删除账号
@@ -489,10 +951,23 @@ export function AccountCard({ account, onDelete, onNoteSaved, onCheckin, onRefre
         </div>
 
         {compact ? (
-          <div className="relative z-10 flex w-full min-w-0 items-center gap-2 pr-10">
-            <h3 className="min-w-0 flex-1 truncate text-[13px] font-semibold leading-5" title={name}>{name}</h3>
-            <div className="hidden shrink-0 items-center gap-1 min-[420px]:flex">{statusChips}</div>
-            <div className="ml-auto flex shrink-0 items-center gap-1">
+          /* 紧凑头部改为**两行**（所有者确认的方案 B / 2-B）：
+             第一行 = 名字 + 三个产品切换图标 + ⋯；第二行 = 状态标签。
+             
+             为什么必须分行：紧凑列宽 ≈ 300px（栅格 minmax(min(100%,300px),1fr)），
+             而原来一行要放的全部是 shrink-0（不可压缩）：
+               备注 chip(max-w-12rem=192) + 已签到(62) + 需重登(66) + 三图标(92) + ⋯预留(40)
+               ≈ 452px > 300px
+             结果就是**三个产品按钮被挤出可视区**（所有者实测反馈「按钮都挤下去了」）。
+             原实现用 `min-[420px]:flex` 把状态区整个藏掉来回避，代价是窄列下状态全丢；
+             分行则两边都保住：图标不再被挤，状态也还能换行显示。
+             
+             状态行不再限 hidden/min-[420px]：分行后它有自己的整行宽度，
+             窄列下换行即可，没有必要再藏（藏了就等于「紧凑模式看不到状态」）。 */
+          <div className="relative z-10 flex w-full min-w-0 flex-col">
+            <div className="flex w-full min-w-0 items-center gap-2 pr-10">
+              <h3 className="min-w-0 flex-1 truncate text-[13px] font-semibold leading-5" title={name}>{name}</h3>
+              <div className="ml-auto flex shrink-0 items-center gap-1">
               {workbuddyActive ? (
                 <Tooltip>
                   <TooltipTrigger asChild>
@@ -565,7 +1040,11 @@ export function AccountCard({ account, onDelete, onNoteSaved, onCheckin, onRefre
                   <TooltipContent side="top">{codebuddyCliConfigured ? "设为 CodeBuddy CLI 当前账号" : "请先接入 CodeBuddy CLI"}</TooltipContent>
                 </Tooltip>
               )}
+              </div>
             </div>
+            {/* 第二行：状态标签。紧凑列宽约 300px，这一行独占整宽后可换行，
+                所以不再需要原来那个 `hidden min-[420px]:flex` 的回避手段。 */}
+            <div className="mt-1.5 flex w-full min-w-0 flex-wrap items-center gap-1">{statusChips}</div>
           </div>
         ) : (
           <div className={cn("relative z-10 flex w-full min-w-0 items-center gap-3", workbuddyActive || codebuddyCliActive ? "pr-[112px]" : "pr-10")}>
@@ -793,6 +1272,26 @@ export function AccountCard({ account, onDelete, onNoteSaved, onCheckin, onRefre
             </Button>
             <Button onClick={() => setDetailOpen(false)}>关闭</Button>
           </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* 单账号记录：任务执行 / 积分变化 / Token 消耗，带日期筛选。
+          用较宽的对话框（max-w-4xl）：这三类记录要在一屏里看清需要横向空间。 */}
+      <Dialog open={recordsOpen} onOpenChange={setRecordsOpen}>
+        <DialogContent className="sm:max-w-4xl">
+          <DialogHeader>
+            <DialogTitle>账号记录</DialogTitle>
+            <DialogDescription>
+              {name} 的任务执行、积分变化与 Token 消耗；可按日期区间筛选。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="min-w-0 max-h-[70vh] overflow-y-auto pr-1">
+            <AccountRecordsView
+              accounts={[]}
+              fixedAccountId={account.id}
+              compact
+            />
+          </div>
         </DialogContent>
       </Dialog>
     </TooltipProvider>

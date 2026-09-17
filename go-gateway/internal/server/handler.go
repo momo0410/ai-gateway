@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/prompt"
+	"workbuddy2api/internal/scheduler"
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
 	"workbuddy2api/internal/usage"
@@ -33,14 +35,54 @@ type Config struct {
 	RefreshSkew  time.Duration // token 提前刷新窗口，默认 10m
 	// Usage Token 用量统计器（可选；nil = 不统计，/usage 返回 enabled=false）。
 	Usage *usage.Stats
-	// AllowedModel 「单一模型」锁定：非空时**只放行这一个模型**，其余一律拒绝。
+	// RunTask 手动触发一轮养号任务（活跃上报 / 夜猫子 / 开学季 / trial）。
 	//
-	// 用于「单一模型 + 积分轮转」模式：轮转的语义是「把这个账号的某个模型额度
-	// 烧干净再换下一个账号」，因此必须锁定模型 —— 否则客户端换个模型就能绕过
-	// 轮转策略，账号选择与额度消耗都会变得不可预期。
+	// 用回调而非直接持有 *scheduler.Scheduler：server 包不该依赖调度器的
+	// 内部结构（Config 字段、排程循环），只借一个「按名字跑一轮」的入口，
+	// 依赖方向仍是 main 组装、server 消费。nil = 该能力不可用（如单测）。
+	RunTask func(name string) (scheduler.TaskRunResult, error)
+
+
+	// GrowthTasks 成长任务「一键完成」能力的回调。
 	//
-	// 空串 = 不限制（默认，向后兼容）。大小写不敏感比较。
+	// 与 RunTask 同样的依赖倒置理由：server 包不该依赖 growtask 的内部结构
+	// （Runner 的编排、动作注册表），只借三个入口。nil = 该能力不可用（如单测）。
+	//
+	// 为什么需要它：这 17 个成长任务的实现此前只存在于库里、没有任何对外入口，
+	// 因此被链接器的死代码消除剔出了二进制 —— 表现为「代码写了但根本调不到」。
+	GrowthTasks *GrowthTaskAPI
+
+	// AllowedModels 「限制使用的模型」白名单：**非空时只放行列表内的模型**，
+	// 其余一律拒绝；空（或 nil）= 不限制（默认，向后兼容）。
+	//
+	// 三个工作模式（自动 / 积分轮转 / 手动）共用同一份白名单 —— 它限制的是
+	// 「网关放行哪些模型」，与「用哪些账号」是正交的两件事，所以不该只在
+	// 轮转模式下生效。轮转模式尤其依赖它：轮转的语义是「把这个账号的某个
+	// 模型额度烧干净再换下一个账号」，模型是策略的一部分，不锁定的话客户端
+	// 换个模型就能绕过轮转策略，账号选择与额度消耗都会变得不可预期。
+	//
+	// 大小写不敏感比较；元素两侧空白被忽略；元素自带 `cn:` / `global:` 前缀
+	// 时先剥掉再比较（用户既可能在界面上选到裸名，也可能手写带前缀的名字）。
+	// 由 NewHandler 归一化后缓存到 Handler.allowed，请求路径上零分配。
+	AllowedModels []string
+
+	// AllowedModel 已废弃的**单值**写法（历史字段，仅为向后兼容保留）。
+	//
+	// 老配置里可能是 `pool.allowed_model: "deepseek-v4.1-flash"` 这样的字符串，
+	// 调用方（main.go）读出来塞在这里。NewHandler 会把它并进 AllowedModels，
+	// 因此老配置的行为逐字不变。**新代码一律用 AllowedModels。**
 	AllowedModel string
+
+	// PromptMode 系统提示词替换模式："passthrough"（缺省）/ "custom"。
+	//
+	// 空串按 passthrough 处理（NewHandler 里兜底）：这是**新增能力**，
+	// 既有的调用方与老配置都没有这个字段，必须保持「透传客户端原始 system」
+	// 的既有行为不变。
+	PromptMode string
+	// PromptText custom 模式下注入的自有系统提示词文本（来自 config.PromptText）。
+	//
+	// 在配置解析阶段一次性读盘并缓存，请求路径只做内存改写（不做文件 IO）。
+	PromptText string
 }
 
 // ServiceName 网关身份标识。经 /healthz 响应体 service 字段与 X-Service 头同时透出：
@@ -52,6 +94,14 @@ const ServiceName = "workbuddy2api"
 type Handler struct {
 	cfg Config
 	mux *http.ServeMux
+	// allowed 「限制使用的模型」白名单（已归一化：剥前缀、去空白）。
+	//
+	// 在 NewHandler 里算一次并缓存，而不是每个请求现算：归一化会分配，
+	// 而请求路径上（forwardChat 每次调用）做这件事纯属浪费 —— 白名单
+	// 只在进程启动时定一次，运行期不会变（改了配置要重启网关）。
+	//
+	// 空（nil 或零长度）= 不限制，这是默认值也是老配置的行为。
+	allowed []string
 }
 
 // NewHandler 构建 handler。
@@ -65,7 +115,23 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.RefreshSkew <= 0 {
 		cfg.RefreshSkew = 10 * time.Minute
 	}
-	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
+	// 缺省 passthrough：未显式配置时严格保持既有行为（透传客户端原始 system）。
+	// 直接在 Config 上兜底而不是依赖调用方传对，是为了让「忘记传」也不可能
+	// 变成「静默替换别人的 system」——后者的破坏性远大于一个默认值。
+	if strings.TrimSpace(cfg.PromptMode) == "" {
+		cfg.PromptMode = prompt.ModePassthrough
+	}
+	// 白名单归一化：多值字段 + 老配置的单值字段**合并**（不是二选一）。
+	//
+	// 为什么合并而不是「多值非空就忽略单值」：宿主升级过程中可能出现两者
+	// 同时被写进配置的中间态（新的写多值、旧的单值还留在文件里）。若此时
+	// 忽略单值，用户原来锁定的那个模型会**静默失效** —— 表现为「升级后
+	// 限制突然不管用了」，是安全方向的错误，宁可多放行一个也不能漏。
+	h := &Handler{
+		cfg:     cfg,
+		mux:     http.NewServeMux(),
+		allowed: normalizeAllowedModels(append(append([]string{}, cfg.AllowedModels...), cfg.AllowedModel)),
+	}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
 	h.mux.HandleFunc("POST /responses", h.withAuth(h.responses))
@@ -80,6 +146,10 @@ func NewHandler(cfg Config) *Handler {
 	// /debug/* 同样走鉴权：它透出账号 UID 与域名，属敏感信息。
 	h.mux.HandleFunc("GET /debug/", h.withAuth(h.debugHandler))
 	h.mux.HandleFunc("GET /usage", h.withAuth(h.usageReport))
+	// 养号任务手动触发：与 /status 同用 withAuth —— 它会向上游发真实请求，
+	// 未鉴权暴露等于给人一个刷账号活跃度的开关。
+	h.mux.HandleFunc("POST /tasks/run", h.withAuth(h.tasksRun))
+	h.mux.HandleFunc("POST /tasks/growth", h.withAuth(h.growthTasks))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	return h
 }
@@ -152,6 +222,128 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		"sticky_sessions": sticky,
 		"redis_mode":      redisMode,
 	})
+}
+
+// GrowthTaskAPI 成长任务能力的最小接口面。
+//
+// 刻意用回调/窄接口而不是 import growtask 的具体类型：与 RunTask 同一条
+// 依赖倒置原则 —— server 只负责 HTTP 编解码与错误映射，编排逻辑留在 growtask 包。
+// 字段全是函数，main 组装时按需注入；nil 字段对应「该能力不可用」。
+type GrowthTaskAPI struct {
+	// List 列出某账号的成长任务（只读，无副作用）。参数是宿主账号库的 id。
+	List func(accountID string) (any, error)
+	// RunOne 对单账号执行单个任务。code 为空表示「跑该账号的全部待办」。
+	RunOne func(accountID, code string) (any, error)
+	// RunAll 对所有国服账号跑一轮（整轮，耗时可到分钟级）。
+	RunAll func() (any, error)
+}
+
+// growthTasks 成长任务入口（POST /tasks/growth，body: {"action":"list|run","accountId":"...","taskCode":"..."}）。
+//
+// 为什么用单一路由 + action 而不是三条路由：这三个动作共享同一个账号解析与
+// 忙碌判定，拆开会把「账号没找到 / 账号正忙」的错误映射抄三遍，
+// 而它们必须完全一致（否则三个入口对同一状况给出不同提示）。
+func (h *Handler) growthTasks(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.GrowthTasks == nil {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "growth_tasks_unavailable",
+			"growth task runner not configured on this gateway instance")
+		return
+	}
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	var req struct {
+		Action    string `json:"action"`
+		AccountID string `json:"accountId"`
+		TaskCode  string `json:"taskCode"`
+	}
+	if err := jsonUnmarshal(string(body), &req); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "invalid JSON body")
+		return
+	}
+
+	api := h.cfg.GrowthTasks
+	var (
+		res any
+		err error
+	)
+	switch strings.TrimSpace(req.Action) {
+	case "list":
+		if api.List == nil {
+			writeOpenAIError(w, http.StatusServiceUnavailable, "growth_tasks_unavailable", "list not configured")
+			return
+		}
+		if strings.TrimSpace(req.AccountID) == "" {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "missing accountId")
+			return
+		}
+		res, err = api.List(strings.TrimSpace(req.AccountID))
+	case "run":
+		if api.RunOne == nil {
+			writeOpenAIError(w, http.StatusServiceUnavailable, "growth_tasks_unavailable", "run not configured")
+			return
+		}
+		if strings.TrimSpace(req.AccountID) == "" {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "missing accountId")
+			return
+		}
+		res, err = api.RunOne(strings.TrimSpace(req.AccountID), strings.TrimSpace(req.TaskCode))
+	case "run-all":
+		if api.RunAll == nil {
+			writeOpenAIError(w, http.StatusServiceUnavailable, "growth_tasks_unavailable", "run-all not configured")
+			return
+		}
+		res, err = api.RunAll()
+	default:
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
+			`unknown action (want "list" | "run" | "run-all")`)
+		return
+	}
+
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "growth_task_failed", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+// tasksRun 手动触发一轮养号任务（POST /tasks/run，body: {"task":"activity"}）。
+//
+// 为什么要有这个入口：这 4 个任务此前只有「按点自动跑」，用户既看不见执行结果、
+// 也没法在改完配置后立刻验证。手动触发是**可观测性**的一部分。
+//
+// 返回 200 + ran=false 表示「被前置条件挡下」（如夜猫子不在时段内）——
+// 这是正常状态而非错误，宿主界面据此给出人话说明；真正的问题（未知任务名）
+// 才返回 400。
+func (h *Handler) tasksRun(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimSpace(r.URL.Query().Get("task"))
+	if name == "" {
+		body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<16))
+		var parsed struct {
+			Task string `json:"task"`
+		}
+		if err := jsonUnmarshal(string(body), &parsed); err == nil {
+			name = strings.TrimSpace(parsed.Task)
+		}
+	}
+	if name == "" {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "missing task name")
+		return
+	}
+	if h.cfg.RunTask == nil {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "tasks_unavailable",
+			"task runner not configured on this gateway instance")
+		return
+	}
+	res, err := h.cfg.RunTask(name)
+	if errors.Is(err, scheduler.ErrTaskRunning) {
+		// 与宿主 checkin_all 的 already_running 同一语义：不是故障，是防重入。
+		writeJSON(w, http.StatusOK, res)
+		return
+	}
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
 }
 
 // usageReport 返回网关累计 Token 用量（GET /usage?days=N，days 省略或 0 = 全部）。
@@ -496,7 +688,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 // 必须让客户端看到真实原因，而不是被误导去等账号恢复。
 //
 // 两类请求侧错误（两者都是「重试无用、要改请求」）：
-//   - 单一模型模式拒绝 → model_not_allowed（见 modelLockedError）
+//   - 模型不在白名单 → model_not_allowed（见 modelLockedError）
 //   - 上下文超长       → context_length_exceeded
 func openAIFailure(err error) (code, msg string) {
 	if f := failureOf(err); f != nil && f.Kind == FailureContextTooLong {
@@ -523,7 +715,7 @@ func anthropicFailure(err error) (code, msg string) {
 
 // responsesFailure 同上，Responses API 的上游失败码是 upstream_error。
 //
-// 单一模型拒绝沿用 #14 为该协议定的 invalid_request_error，**不**把
+// 模型白名单拒绝沿用 #14 为该协议定的 invalid_request_error，**不**把
 // errorCodeFor 的 model_not_allowed 直接透出：model_not_allowed 是本网关给
 // chat/completions 形状定的码，不属于 Responses 词汇表（见 responsesBodyCodes
 // ——该协议用 invalid_request / payload_too_large）。同理 anthropicFailure 保持
@@ -585,8 +777,8 @@ var responsesBodyCodes = bodyErrorCodes{tooLarge: "payload_too_large", badReques
 
 // errorCodeFor 把 forwardChat 的错误映射成面向客户端的错误码。
 //
-// 区分「模型被单一模型模式拒绝」与「账号都不可用」很重要：前者是**调用方
-// 需要改的东西**（换模型或换模式），后者是**服务端状态**。都报
+// 区分「模型不在白名单」与「账号都不可用」很重要：前者是**调用方
+// 需要改的东西**（换模型或调整「放行模型」），后者是**服务端状态**。都报
 // no_healthy_account 会把用户引向排查账号，而真正的原因在请求里。
 func errorCodeFor(err error) string {
 	var locked *modelLockedError

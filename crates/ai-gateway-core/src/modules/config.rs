@@ -149,6 +149,74 @@ pub const CHECKIN_API_PREFIX: &str = "/v2/billing/meter";
 pub const CHECKIN_LOG_KEEP_DAYS: i64 = 30;
 pub const CHECKIN_LOG_MAX_RECORDS: usize = 500;
 
+// ---------------------------------------------------------------------------
+// 记录保留天数（设置页可配置）
+//
+// 为什么需要可配置：签到日志、积分快照、任务记录都属于「本地观察数据」，
+// 保留多久取决于用户的硬盘与排查需求 —— 有人要长期回溯，有人只想留一周。
+// 硬编码常量会让「改一下」变成「改代码重编译」，因此抽成设置项。
+//
+// 与既有常量的关系：CHECKIN_LOG_KEEP_DAYS 等常量仍是**默认值**，
+// 用户没配时行为与改动前完全一致（零迁移成本）。
+// ---------------------------------------------------------------------------
+
+/// 设置项键名（app_settings.json 里的一项）。
+pub const RECORD_RETENTION_KEY: &str = "recordRetentionDays";
+
+/// 默认保留天数。所有者要求 60 天（此前积分快照硬编码 90 天）。
+pub const RECORD_RETENTION_DEFAULT_DAYS: i64 = 60;
+
+/// 允许的取值范围。
+///
+/// 下限 1 天：0 或负数会让所有记录立即被清理，等于静默关闭记录功能，
+/// 用户很难意识到自己「什么都没存」；真要关闭应显式提供开关而不是填 0。
+/// 上限 3650 天（约 10 年）：防止误填极大值导致清理逻辑溢出或文件无限增长。
+pub const RECORD_RETENTION_MIN_DAYS: i64 = 1;
+pub const RECORD_RETENTION_MAX_DAYS: i64 = 3650;
+
+/// 设置页提供的预设选项（值, 显示文案）。
+///
+/// 只列常用档位而非任意输入：保留天数是「粗粒度」选择，
+/// 下拉/勾选比手填更不容易填错（所有者明确偏好勾选而非手写）。
+pub const RECORD_RETENTION_PRESETS: &[(i64, &str)] = &[
+    (7, "7 天"),
+    (30, "30 天"),
+    (60, "60 天（默认）"),
+    (90, "90 天"),
+    (180, "180 天"),
+    (365, "1 年"),
+];
+
+/// 归一化保留天数：非法值回落到默认值，并夹到允许区间。
+///
+/// 单独抽出来是因为「读取配置」有多个入口（统计、清理、UI 展示），
+/// 每处各自校验容易出现口径不一致。
+pub fn normalize_retention_days(days: i64) -> i64 {
+    if days <= 0 {
+        return RECORD_RETENTION_DEFAULT_DAYS;
+    }
+    days.clamp(RECORD_RETENTION_MIN_DAYS, RECORD_RETENTION_MAX_DAYS)
+}
+
+/// 读取「记录保留天数」设置（缺省或非法时返回默认值）。
+pub fn record_retention_days() -> i64 {
+    let raw = load_app_settings()
+        .get(RECORD_RETENTION_KEY)
+        .and_then(Value::as_i64)
+        .unwrap_or(RECORD_RETENTION_DEFAULT_DAYS);
+    normalize_retention_days(raw)
+}
+
+/// 写入「记录保留天数」设置，返回归一化后的实际生效值。
+///
+/// 返回归一化值而非原样回显：让调用方（与前端）立刻看到真实生效的数字，
+/// 避免「填了 0 但界面显示 0、实际按 60 天清理」这类不一致。
+pub fn set_record_retention_days(days: i64) -> std::io::Result<i64> {
+    let normalized = normalize_retention_days(days);
+    save_app_settings(&serde_json::json!({ RECORD_RETENTION_KEY: normalized }))?;
+    Ok(normalized)
+}
+
 /// 派猫猫旅行接口前缀（成长中心，非 /v2/plugin 体系，直接挂在 API 域名下）。
 pub const TRAVEL_API_PREFIX: &str = "/activity/growth/buddy/travel";
 
@@ -552,7 +620,9 @@ fn legacy_checkin_identity(entry: &Value) -> Option<String> {
 /// legacy `already` rows are reduced to the latest timestamp for one account
 /// and local calendar date.
 fn normalize_checkin_logs(logs: &[Value], at_ms: i64) -> Vec<Value> {
-    let cutoff = at_ms.saturating_sub(CHECKIN_LOG_KEEP_DAYS * 24 * 3600 * 1000);
+    // 保留天数来自设置项（默认 60 天，设置页可调）；
+    // CHECKIN_LOG_KEEP_DAYS 仅作为「用户从未配置过」时的语义参照保留。
+    let cutoff = at_ms.saturating_sub(record_retention_days() * 24 * 3600 * 1000);
     let retained: Vec<(usize, i64, &Value)> = logs
         .iter()
         .enumerate()
@@ -1552,5 +1622,113 @@ mod tests {
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
         );
         let _ = http_client_builder();
+    }
+    // -----------------------------------------------------------------------
+    // 记录保留天数（设置页可配置）
+    //
+    // 默认 60 天；越界值必须被夹到合法区间而不是原样存下 ——
+    // 否则「填 0」会让所有记录立刻被清理，用户却以为只是「先不限制」。
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn retention_normalize_falls_back_on_non_positive() {
+        // 0 与负数都回落到默认值：静默「什么都不存」是最糟的失败模式
+        assert_eq!(normalize_retention_days(0), RECORD_RETENTION_DEFAULT_DAYS);
+        assert_eq!(normalize_retention_days(-1), RECORD_RETENTION_DEFAULT_DAYS);
+        assert_eq!(normalize_retention_days(-9999), RECORD_RETENTION_DEFAULT_DAYS);
+    }
+
+    #[test]
+    fn retention_normalize_clamps_to_range() {
+        assert_eq!(normalize_retention_days(1), RECORD_RETENTION_MIN_DAYS);
+        assert_eq!(normalize_retention_days(60), 60);
+        assert_eq!(normalize_retention_days(365), 365);
+        assert_eq!(
+            normalize_retention_days(i64::MAX),
+            RECORD_RETENTION_MAX_DAYS
+        );
+    }
+
+    #[test]
+    fn retention_default_is_60_days() {
+        assert_eq!(RECORD_RETENTION_DEFAULT_DAYS, 60);
+    }
+
+    #[test]
+    fn retention_presets_are_within_range_and_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for (days, label) in RECORD_RETENTION_PRESETS {
+            assert!(
+                *days >= RECORD_RETENTION_MIN_DAYS && *days <= RECORD_RETENTION_MAX_DAYS,
+                "预设 {days} 天越界"
+            );
+            assert!(seen.insert(*days), "预设 {days} 天重复");
+            assert!(!label.is_empty(), "预设 {days} 天缺少文案");
+        }
+        // 默认值必须能在预设里选到，否则用户改完就回不到默认
+        assert!(
+            RECORD_RETENTION_PRESETS
+                .iter()
+                .any(|(d, _)| *d == RECORD_RETENTION_DEFAULT_DAYS),
+            "预设里必须包含默认值 {} 天",
+            RECORD_RETENTION_DEFAULT_DAYS
+        );
+    }
+
+    #[test]
+    fn retention_reads_default_when_unset() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("retention-unset");
+        assert_eq!(record_retention_days(), RECORD_RETENTION_DEFAULT_DAYS);
+    }
+
+    #[test]
+    fn retention_round_trips_through_settings() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("retention-roundtrip");
+        let applied = set_record_retention_days(30).expect("写入应成功");
+        assert_eq!(applied, 30);
+        assert_eq!(record_retention_days(), 30);
+    }
+
+    #[test]
+    fn retention_save_returns_normalized_value() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("retention-normalized");
+        // 填 0：存下的应是默认值，返回的也必须是真实生效值
+        let applied = set_record_retention_days(0).expect("写入应成功");
+        assert_eq!(applied, RECORD_RETENTION_DEFAULT_DAYS);
+        assert_eq!(record_retention_days(), RECORD_RETENTION_DEFAULT_DAYS);
+
+        // 填极大值：夹到上限
+        let applied = set_record_retention_days(999_999).expect("写入应成功");
+        assert_eq!(applied, RECORD_RETENTION_MAX_DAYS);
+        assert_eq!(record_retention_days(), RECORD_RETENTION_MAX_DAYS);
+    }
+
+    #[test]
+    fn retention_setting_survives_other_settings_writes() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("retention-merge");
+        set_record_retention_days(90).expect("写入应成功");
+        // 其它设置项写入不应覆盖保留天数（合并式写入）
+        save_app_settings(&json!({ "someOtherKey": true })).expect("写入应成功");
+        assert_eq!(record_retention_days(), 90);
+    }
+
+    #[test]
+    fn checkin_log_retention_follows_setting() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("retention-checkin");
+        // 设为 7 天：8 天前的记录应被清掉，6 天前的应保留
+        set_record_retention_days(7).expect("写入应成功");
+        let now = local_timestamp_ms(2026, 8, 20, 12);
+        let day = 24 * 3600 * 1000;
+        let logs = vec![
+            json!({"accountId": "old", "result": "success", "ts": now - 8 * day}),
+            json!({"accountId": "fresh", "result": "success", "ts": now - 6 * day}),
+        ];
+        let kept = normalize_checkin_logs(&logs, now);
+        let ids: Vec<&str> = kept
+            .iter()
+            .filter_map(|v| v.get("accountId").and_then(Value::as_str))
+            .collect();
+        assert!(ids.contains(&"fresh"), "6 天前的记录应保留，实际 {ids:?}");
+        assert!(!ids.contains(&"old"), "8 天前的记录应被清理，实际 {ids:?}");
     }
 }

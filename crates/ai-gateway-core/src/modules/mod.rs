@@ -1,4 +1,6 @@
 pub mod account;
+// 账号记录：任务 / 积分 / Token 三类事件的统一追加式流水，供单账号记录视图查询。
+pub mod account_records;
 pub mod agent_import;
 // 多应用档案表（5 应用 × 3 快照布局）：切换流程的表驱动参数源。
 pub mod app_profile;

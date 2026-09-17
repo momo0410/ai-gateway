@@ -682,11 +682,38 @@ fn credit_result(account: &Value, resources: Vec<Value>, now: i64) -> Value {
     let account_id = account.get("id").cloned().unwrap_or(Value::Null);
     let account_name = account_display_name(account);
     if let Some(account_id) = account_id.as_str() {
+        // 带上包级明细：上游偶发返回不完整的包列表，只看聚合值会把「没读到」
+        // 误判成「积分消耗」（实测所有者数据里出现 -380/+380 的幻影配对）。
+        //
+        // 键优先用 packageCode；缺失时退用 packageName，再退用下标 ——
+        // 保证每个包都有稳定标识。**不能**用 `remaining` 当键（它随余额变化而变，
+        // 那样同一个包每次都被当成新包，判据失效）。
+        let mut packages = std::collections::BTreeMap::new();
+        for (index, resource) in resources.iter().enumerate() {
+            let key = resource
+                .get("packageCode")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| {
+                    resource
+                        .get("packageName")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                })
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("#{index}"));
+            let remaining = resource
+                .get("remaining")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            packages.insert(key, remaining);
+        }
         let _ = credit_usage::record_snapshot(
             account_id,
             &account_name,
             total_capacity,
             total_remaining,
+            packages,
         );
     }
 

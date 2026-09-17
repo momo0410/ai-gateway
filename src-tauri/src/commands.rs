@@ -160,6 +160,27 @@ pub fn set_account_note(account_id: String, note: String) -> Result<Value, Strin
     Ok(json!({ "ok": true, "account": account::account_meta(&acc) }))
 }
 
+/// POST /api/accounts/disabled —— 设置账号的禁用状态。
+///
+/// 语义（与所有者确认）：禁用 = **不进网关账号池**，但签到 / 旅行 / 上报等
+/// 养号任务照跑。「号暂时不接流量」不等于「不要额度与连登天数」，
+/// 把两者绑死会让用户失去「先养着，以后再启用」这个最常用的用法。
+///
+/// 禁用只改本地账号库字段；真正生效需要在导出凭证时过滤（见 gateway.rs 的
+/// should_export），因此这里顺带触发一次重导出 + 重启，做到「点了就生效」。
+#[tauri::command]
+pub async fn set_account_disabled(account_id: String, disabled: bool) -> Result<Value, String> {
+    let acc = account::set_account_disabled(&account_id, disabled)?;
+    // 禁用状态直接影响导出集合：立刻重导出，网关在跑则重启以加载新池。
+    // 失败不阻断（账号状态已存好），但要如实回报，否则用户以为没生效。
+    let sync = ai_gateway_core::modules::gateway::sync_and_reload(true).await;
+    Ok(json!({
+        "ok": true,
+        "account": account::account_meta(&acc),
+        "sync": sync,
+    }))
+}
+
 /// POST /api/oauth/start —— 发起 OAuth 扫码登录。
 ///
 /// `region` 为 `"cn"`（缺省）或 `"intl"`：决定取 state 的域名与平台标识
@@ -456,6 +477,83 @@ pub fn get_checkin_logs() -> Value {
 }
 
 // ---------------------------------------------------------------------------
+// 记录保留设置（设置页可调）
+//
+// 覆盖签到日志、积分快照、任务记录三类本地观察数据。
+// 默认 60 天；用户可改，改完立刻对后续清理生效（无需重启）。
+// ---------------------------------------------------------------------------
+
+/// GET /api/settings/retention —— 读取保留天数设置。
+///
+/// 同时返回预设档位，避免前端硬编码选项（两处各写一份容易不一致）。
+#[tauri::command]
+pub fn get_record_retention() -> Value {
+    use crate::modules::config::{
+        record_retention_days, RECORD_RETENTION_DEFAULT_DAYS, RECORD_RETENTION_MAX_DAYS,
+        RECORD_RETENTION_MIN_DAYS, RECORD_RETENTION_PRESETS,
+    };
+    json!({
+        "days": record_retention_days(),
+        "defaultDays": RECORD_RETENTION_DEFAULT_DAYS,
+        "minDays": RECORD_RETENTION_MIN_DAYS,
+        "maxDays": RECORD_RETENTION_MAX_DAYS,
+        "presets": RECORD_RETENTION_PRESETS
+            .iter()
+            .map(|(d, label)| json!({ "days": d, "label": label }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// POST /api/settings/retention —— 保存保留天数。
+///
+/// 返回归一化后的实际生效值：用户填了越界值时立刻看到真实数字，
+/// 而不是「界面显示 0、实际按 60 天清理」。
+#[tauri::command]
+pub fn save_record_retention(days: i64) -> Result<Value, String> {
+    let applied = crate::modules::config::set_record_retention_days(days).map_err(|e| e.to_string())?;
+    Ok(json!({ "days": applied }))
+}
+
+// ---------------------------------------------------------------------------
+// 账号记录（任务 / 积分 / Token 三类事件的统一流水）
+// ---------------------------------------------------------------------------
+
+/// GET /api/account-records —— 查询账号记录。
+///
+/// 参数（全部可选）：
+///   - accountId：为空 = 全部账号
+///   - from / to：毫秒时间戳区间（含端点）；0 = 不限
+///   - kinds：事件类型数组（task / credit / token）；空 = 全部
+///   - limit：最多返回多少条；0 = 不限
+#[tauri::command]
+pub fn get_account_records(
+    account_id: Option<String>,
+    from: Option<i64>,
+    to: Option<i64>,
+    kinds: Option<Vec<String>>,
+    limit: Option<usize>,
+) -> Value {
+    crate::modules::account_records::query_records(
+        account_id.as_deref().unwrap_or(""),
+        from.unwrap_or(0),
+        to.unwrap_or(0),
+        &kinds.unwrap_or_default(),
+        limit.unwrap_or(500),
+    )
+}
+
+/// POST /api/account-records/backfill —— 把历史签到日志回填为账号记录。
+///
+/// 前端在首次打开「账号记录」时调用一次；幂等，重复调用不会产生重复记录。
+#[tauri::command]
+pub fn backfill_account_records() -> Result<Value, String> {
+    match crate::modules::account_records::backfill_from_checkin_logs() {
+        Ok(added) => Ok(json!({ "added": added })),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 派猫猫旅行
 // ---------------------------------------------------------------------------
 
@@ -541,9 +639,24 @@ pub fn get_github_config() -> Value {
 }
 
 /// POST /api/update/config —— 保存更新源配置。
+///
+/// 前端（src/lib/api.ts::saveGithubConfig）把配置包在 `config` 键里传进来
+///（与 webui 的 POST body 同一约定），这里必须剥掉那层壳再交给
+/// `update::save_github_config` —— 后者读的是配置本身。不剥的话它会读到一份
+/// 没有 owner/repo/proxy/proxy_scope 的壳，把地址写成空串、三个开关回落默认值：
+/// 用户点「保存代理」反而把配置清空了，而且返回 Ok 毫无报错。
+///
+/// 同时容忍**裸配置**（直接传配置对象）：无脑只看 `config` 键会让裸形状被读成
+/// 空配置，那是同一个坑的另一面。
 #[tauri::command]
 pub fn save_github_config(config: Value) -> Result<Value, String> {
-    update::save_github_config(&config).map_err(|e| e.to_string())?;
+    let submitted = match config.get("config") {
+        // config 键存在且是个对象 → 用它（真实调用形状）
+        Some(inner) if inner.is_object() => inner.clone(),
+        // 其余（不存在 / null / 非对象）→ 整个参数就是配置
+        _ => config,
+    };
+    update::save_github_config(&submitted).map_err(|e| e.to_string())?;
     Ok(update::load_github_config())
 }
 
@@ -691,13 +804,29 @@ pub fn get_gateway_config() -> Result<Value, String> {
 /// 前端以 camelCase 传参（`{ port, apiKey, autoStart }`），故此处声明
 /// `rename_all = "camelCase"`；只把出现的字段透传给 core 做浅合并，
 /// 未传字段沿用磁盘上的现有值。
+///
+/// 养号任务排程（activity_hours 等）也走这里：它们最终由 write_native_config
+/// 转写进网关的 config.json，与 checkin_enabled 等既有字段同一来源。
 #[tauri::command(rename_all = "camelCase")]
+#[allow(clippy::too_many_arguments)]
 pub fn save_gateway_config(
     port: Option<u16>,
     api_key: Option<String>,
     auto_start: Option<bool>,
     mode: Option<String>,
     pinned_uid: Option<String>,
+    manual_uids: Option<Vec<String>>,
+    activity_hours: Option<Vec<i64>>,
+    nightowl_hours: Option<Vec<i64>>,
+    school_hours: Option<Vec<i64>>,
+    trial_hours: Option<Vec<i64>>,
+    activity_enabled: Option<bool>,
+    nightowl_enabled: Option<bool>,
+    school_enabled: Option<bool>,
+    trial_enabled: Option<bool>,
+    activity_report_count: Option<i64>,
+    prompt_mode: Option<String>,
+    prompt_file: Option<String>,
 ) -> Result<Value, String> {
     let mut patch = serde_json::Map::new();
     if let Some(p) = port {
@@ -715,8 +844,88 @@ pub fn save_gateway_config(
     if let Some(u) = pinned_uid {
         patch.insert("pinned_uid".to_string(), json!(u));
     }
+    // 手动模式勾选的账号列表（多选）
+    if let Some(list) = manual_uids {
+        let cleaned: Vec<String> = list
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        patch.insert("manual_uids".to_string(), json!(cleaned));
+    }
+    // 养号任务排程：与上面同样「传了才覆盖」，未传则保留磁盘上的现有值。
+    for (key, value) in [
+        ("activity_hours", activity_hours),
+        ("nightowl_hours", nightowl_hours),
+        ("school_hours", school_hours),
+        ("trial_hours", trial_hours),
+    ] {
+        if let Some(hours) = value {
+            patch.insert(key.to_string(), json!(hours));
+        }
+    }
+    for (key, value) in [
+        ("activity_enabled", activity_enabled),
+        ("nightowl_enabled", nightowl_enabled),
+        ("school_enabled", school_enabled),
+        ("trial_enabled", trial_enabled),
+    ] {
+        if let Some(flag) = value {
+            patch.insert(key.to_string(), json!(flag));
+        }
+    }
+    if let Some(n) = activity_report_count {
+        patch.insert("activity_report_count".to_string(), json!(n));
+    }
+    // 自定义系统提示词：同样「传了才覆盖」，未传则保留磁盘上的现有值 ——
+    // 旧客户端不传这两个字段，绝不能把它们重置（那会把用户已配好的提示词抹掉）。
+    if let Some(m) = prompt_mode {
+        patch.insert("prompt_mode".to_string(), json!(m));
+    }
+    if let Some(f) = prompt_file {
+        patch.insert("prompt_file".to_string(), json!(f));
+    }
     let v = ai_gateway_core::modules::gateway::save_gateway_config(&Value::Object(patch))?;
     Ok(json!({ "config": v }))
+}
+
+/// POST /tasks/run —— 手动触发网关侧一轮养号任务（活跃上报 / 夜猫子 / 开学季 / trial）。
+///
+/// 手动触发**不**检查「启用」开关：该开关只管后台是否自动排程，用户主动点击就该执行
+///（与 `checkin_all` / `travel_run` 的既有语义一致）。
+///
+/// 返回值里的 `ran=false` + `skip` 是**正常结果**（如夜猫子不在 23:00–08:00 窗口内），
+/// 界面应当作说明展示而非报错 —— 否则用户点了「立即执行」看到红色错误会以为坏了。
+#[tauri::command]
+pub async fn run_gateway_task(task: String) -> Result<Value, String> {
+    Ok(ai_gateway_core::modules::gateway::run_task_now(&task).await)
+}
+
+/// POST /tasks/growth —— 成长任务「一键完成」（列表 / 单账号执行 / 全账号执行）。
+///
+/// `action` 取 `list` / `run` / `run-all`：
+///   - `list`：列出该账号的成长任务（只读，秒级返回）
+///   - `run`：执行该账号的任务；`task_code` 为空 = 跑全部待办
+///   - `run-all`：所有账号跑一轮
+///
+/// **耗时差异很大**：`list` 秒级；`run` 单账号分钟级（可能含真实对话，
+/// 会消耗 token 与额度）；`run-all` 更久。界面必须给出「正在执行」的反馈，
+/// 否则用户会以为没反应而反复点击 —— 而重复点击会重复消耗。
+///
+/// 错误一律走返回值的 `error` 字段而不是 Err（与 run_gateway_task 一致）：
+/// 让界面能同时拿到失败原因，而不是整条请求变红、拿不到任何上下文。
+#[tauri::command]
+pub async fn run_growth_task(
+    action: String,
+    account_id: Option<String>,
+    task_code: Option<String>,
+) -> Result<Value, String> {
+    Ok(ai_gateway_core::modules::gateway::growth_task(
+        &action,
+        account_id.as_deref().unwrap_or(""),
+        task_code.as_deref().unwrap_or(""),
+    )
+    .await)
 }
 
 /// 检测端口是否可用。
@@ -728,15 +937,61 @@ pub fn check_gateway_port(port: u16) -> Result<Value, String> {
     Ok(ai_gateway_core::modules::gateway::inspect_port(port))
 }
 
+/// 查询占用指定端口的进程（供「结束占用进程」对话框展示）。
+///
+/// **按需调用**：会 spawn netstat/tasklist/powershell，不要在页面挂载或轮询里调
+///（那正是热路径 `check_gateway_port` 刻意不查进程的原因）。
+/// 同样用 async + spawn_blocking：进程调用是阻塞的，不该占用主线程或异步运行时线程。
+#[tauri::command]
+pub async fn get_gateway_port_holder(port: u16) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(json!({
+            "port": port,
+            "holder": ai_gateway_core::modules::gateway::port_holder(port).unwrap_or(Value::Null),
+        }))
+    })
+    .await
+    .map_err(|e| format!("执行失败: {e}"))?
+}
+
+/// 结束占用指定端口的进程，让本网关可以接管该端口。
+///
+/// 由前端在用户**明确确认**后调用（提示里会展示占用进程名与 PID）。
+/// 后端仍会拒绝几类危险目标（自身进程、本程序启动的网关），
+/// 因此前端即便误调用也不会造成「网关被自己杀掉」的状态不一致。
+///
+/// **必须是 async**：本命令要 spawn 3 个控制台进程查占用者，并轮询等待端口释放
+///（最长 4 秒）。同步 Tauri 命令跑在主线程，会把这些开销直接变成界面卡死。
+#[tauri::command]
+pub async fn kill_gateway_port_holder(port: u16) -> Result<Value, String> {
+    // 放到阻塞线程池：内部是 std::process + sleep 轮询，不占异步运行时线程
+    tauri::async_runtime::spawn_blocking(move || {
+        ai_gateway_core::modules::gateway::kill_port_holder(port)
+    })
+    .await
+    .map_err(|e| format!("执行失败: {e}"))?
+}
+
 /// 切换网关工作模式并立即生效（重导出凭证 + 按需重启）。
 ///
 /// 与 `save_gateway_config` 的区别：后者只写配置文件，而网关的账号池是
 /// 启动时建立的，因此改完必须手动重启才生效。本命令把「保存 + 重导出 + 重启」
-/// 合成一步，让「负载均衡 ↔ 指定账号」点击即生效。
+/// 合成一步，让「自动 ↔ 手动」点击即生效。
+///
+/// `manual_uids` 是手动模式下勾选的账号列表；`pinned_uid` 保留仅为兼容旧前端调用。
 #[tauri::command(rename_all = "camelCase")]
-pub async fn switch_gateway_mode(mode: String, pinned_uid: Option<String>) -> Result<Value, String> {
+pub async fn switch_gateway_mode(
+    mode: String,
+    manual_uids: Option<Vec<String>>,
+    pinned_uid: Option<String>,
+) -> Result<Value, String> {
     let mode = ai_gateway_core::modules::gateway::GatewayMode::from_str(&mode);
-    let result = ai_gateway_core::modules::gateway::switch_mode(mode, pinned_uid).await;
+    // 新字段优先；旧前端只传 pinned_uid 时按「只勾了那一个」处理
+    let uids: Vec<String> = match manual_uids {
+        Some(list) => list,
+        None => pinned_uid.into_iter().collect(),
+    };
+    let result = ai_gateway_core::modules::gateway::switch_mode(mode, uids).await;
     if result.get("ok").and_then(Value::as_bool) == Some(false) {
         let msg = result
             .get("error")
@@ -748,9 +1003,27 @@ pub async fn switch_gateway_mode(mode: String, pinned_uid: Option<String>) -> Re
     Ok(result)
 }
 
-/// 设置「单一模型 + 积分轮转」的目标模型；空串 = 清除锁定。
+/// 设置「限制使用的模型」白名单（多选）；空数组 = 清除限制（全部放行）。
 ///
-/// 网关运行时自动重启以生效（模型锁定由网关启动时读取，与切换模式同理）。
+/// 网关运行时自动重启以生效（模型限制由网关启动时读取，与切换模式同理）。
+#[tauri::command]
+pub async fn set_allowed_models(models: Vec<String>) -> Result<Value, String> {
+    let result = ai_gateway_core::modules::gateway::set_allowed_models(&models).await;
+    if result.get("ok").and_then(Value::as_bool) == Some(false) {
+        let msg = result
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("设置模型限制失败")
+            .to_string();
+        return Err(msg);
+    }
+    Ok(result)
+}
+
+/// 设置单个模型限制；空串 = 清除限制。
+///
+/// 保留这个**单值**入口是为了向后兼容（旧前端、脚本、已发布版本的自调用）：
+/// 它现在等价于 `set_allowed_models` 传一个单元素数组。
 #[tauri::command]
 pub async fn set_allowed_model(model: String) -> Result<Value, String> {
     let result = ai_gateway_core::modules::gateway::set_allowed_model(&model).await;

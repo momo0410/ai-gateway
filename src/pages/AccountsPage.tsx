@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import {
   ChevronDown,
@@ -44,7 +44,7 @@ import { OAuthLoginDialog } from "@/components/oauth-login-dialog";
 import { SwitchAccountDialog } from "@/components/switch-account-dialog";
 import * as api from "@/lib/api";
 import { useVisibilityInterval } from "@/lib/use-visibility-interval";
-import type { AccountMeta, AppStatus, CheckinConfig, CodeBuddyCliStatus, CodeBuddyCnIdeStatus, CreditExpiry, TravelConfig, TravelStatus } from "@/lib/types";
+import type { AccountMeta, AccountRunningTask, AppStatus, CheckinConfig, CodeBuddyCliStatus, CodeBuddyCnIdeStatus, CreditExpiry, GatewayTaskName, GatewayTaskRuntime, TravelConfig, TravelStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { useAccountsStore } from "@/stores/accounts";
 
@@ -176,6 +176,21 @@ export default function AccountsPage() {
   const [checkinAllRunning, setCheckinAllRunning] = useState(false);
   /** 一键旅行进行中（下拉菜单项） */
   const [travelRunning, setTravelRunning] = useState(false);
+  /**
+   * 正在执行的养号任务名（卡片菜单的「本账号养护 → 养号任务」组）。
+   *
+   * 单一状态而非按卡片分组：这些任务是**整轮**触发（作用于全部账号），
+   * 同一时刻只应有一个在跑；按卡片分组反而会让人以为每个号各跑各的。
+   */
+  const [taskRunning, setTaskRunning] = useState<GatewayTaskName>();
+  /**
+   * 网关侧正在执行的养号任务（含「哪些账号已跑过」）。
+   *
+   * 为什么不能复用上面的 `taskRunning`：那个只覆盖**本页这一次请求**，
+   * 一旦任务由别处（设置页的「立即执行」）触发、或本页刷新后，它就是空的，
+   * 而任务其实还在跑。网关侧状态是唯一权威来源，卡片标记必须读它。
+   */
+  const [taskRuntime, setTaskRuntime] = useState<GatewayTaskRuntime | null>(null);
   /** 接入/升级 CLI helper 确认框 */
   const [installConfirmOpen, setInstallConfirmOpen] = useState(false);
   /** 删除账号确认目标（null=关闭） */
@@ -349,6 +364,39 @@ export default function AccountsPage() {
     };
   }, [accounts]);
 
+  // 网关任务运行态轮询（5 秒一轮）。
+  //
+  // 为什么本页要自己拉一次 `gateway_status()`：任务运行态（在跑什么、哪些账号
+  // 已跑过）只在这个接口里（`taskRuntime`）。本页此前**没有任何** status 轮询
+  // —— 已有的两条轮询分别是 `getTravelStatus`（60 秒）与积分，都不含该字段；
+  // 而设置页那个 2 秒轮询只在设置页挂载，切回本页就没了。所以这里必须新增一条，
+  // 而不是「复用既有的」（确实没有可复用的）。
+  //
+  // 周期取 5 秒（与网关页的 status 轮询同档，而不是设置页的 2 秒）：设置页 2 秒
+  // 是为了盯着进度条看，而本页只需「一眼看到在跑什么」。5 秒对一轮 40 秒以上的
+  // 任务来说最迟 12% 处就能看到标记，同时把这条**较重**的接口（宿主每次都要
+  // 探活网关 + 解析账号记录文件）的开销压到可接受范围 —— 本页是默认落地页，
+  // 常驻打开，2 秒一轮会长期空转。
+  //
+  // 用 useVisibilityInterval：窗口隐藏/收进托盘时**销毁**定时器，不在后台空转
+  //（与旅行轮询、设置页、网关页同一做法）。
+  //
+  // 失败静默清空（与设置页 loadRuntime 一致）：这是旁路观测数据，网关没起来时
+  // 本来就查不到，为此弹提示只会制造噪音。清空而不是保留旧值 —— 保留会让任务
+  // 结束后仍挂着一个不复存在的标记。
+  const loadTaskRuntime = useCallback(async () => {
+    try {
+      const status = await api.getGatewayStatus();
+      setTaskRuntime(status.taskRuntime ?? null);
+    } catch {
+      setTaskRuntime(null);
+    }
+  }, []);
+
+  useVisibilityInterval(() => void loadTaskRuntime(), 5000, {
+    onResume: () => void loadTaskRuntime(),
+  });
+
   // 只给尚未缓存的账号拉积分；切回首页不重复请求。点「刷新积分」才强制更新。
   useEffect(() => {
     if (!accounts.length) return;
@@ -510,6 +558,36 @@ export default function AccountsPage() {
       void fetchAll();
     } catch (e) {
       toast.error("Token 刷新失败", { description: api.asError(e) });
+    }
+  }
+
+  /**
+   * 手动触发一轮养号任务（活跃上报 / 夜猫子 / 开学季 / trial）。
+   *
+   * 与卡片上其它动作的关键区别：这是**整轮**触发，Go 侧 `RunTaskByName`
+   * 会遍历账号池，作用于全部符合区域条件的账号，而不是当前这张卡片。
+   * 菜单里用分组标题写明了这一点，避免用户以为只是跑了这一个号。
+   *
+   * `ran=false` 是正常结果（夜猫子不在时段、开学季不在活动期），
+   * 按说明展示而非报错 —— 否则用户会把「上游不计入」当成功能坏了。
+   */
+  async function onRunTask(task: GatewayTaskName) {
+    setTaskRunning(task);
+    try {
+      const res = await api.runGatewayTask(task);
+      if (!res.ok) {
+        toast.error("任务执行失败", { description: res.error || "未知错误" });
+      } else if (!res.ran) {
+        toast.info("本次未执行", { description: res.message || "前置条件不满足" });
+      } else {
+        toast.success("已触发一轮", { description: res.message || "任务已开始执行" });
+      }
+      // 任务会写账号记录与积分，回读一次让「账号记录」立刻反映
+      if (res.ok && res.ran) void fetchAll();
+    } catch (e) {
+      toast.error("任务执行失败", { description: api.asError(e) });
+    } finally {
+      setTaskRunning(undefined);
     }
   }
 
@@ -688,6 +766,31 @@ export default function AccountsPage() {
     creditOrderingReady
       ? orderedAccounts.find((account) => hasExpiringSoonCredits(creditMap[account.id]))?.id
       : undefined;
+  /**
+   * 「本轮已跑」标记：账号库 id → 标记内容。
+   *
+   * 判定口径必须用 `account.id`（账号库主键），**不能用 uid**：后端
+   * `taskRuntime.processedIds` 就是账号库 id（Rust 侧 `task_runtime` 的注释
+   * 明确写过「用 uid 会一个都对不上，且不会有任何报错」）。而本页的
+   * `AccountMeta` 恰好两者都有，写错在这里不会报错、只会静默不显示。
+   *
+   * `label` 缺省时**不**给标记：标签文案就是「在跑什么」，没有任务名的标记
+   * 是一句无信息量的「本轮已跑」，不值得占卡片位置。
+   *
+   * 不在本轮范围内的账号（区域不符 / 已禁用 / 需重登）不会出现在 `processedIds`
+   * 里 —— 后端 `total` 与 Go 侧各任务的过滤条件一致地排除了它们，因此这些卡片
+   * 自然不显示标记，不会被误认为「所有号都在跑」。
+   */
+  const runningTaskByAccountId = new Map<string, AccountRunningTask>();
+  if (taskRuntime?.running && taskRuntime.label) {
+    for (const id of taskRuntime.processedIds ?? []) {
+      runningTaskByAccountId.set(id, {
+        label: taskRuntime.label,
+        processed: taskRuntime.processed,
+        total: taskRuntime.total,
+      });
+    }
+  }
   const cliCurrentAccountId = codebuddyCli?.activeAccountId;
   const workbuddyCurrentName = current
     ? current.nickname || current.email || current.uid || "未知账号"
@@ -700,7 +803,17 @@ export default function AccountsPage() {
     ? codebuddyCnIde.activeAccountName || "未检测到"
     : "未安装";
   return (
-    <div className="mx-auto w-full max-w-[1180px] px-6 py-8 sm:px-8 sm:py-9">
+    // 流式布局：内容随窗口铺满（减去侧栏），只保留内边距。
+    //
+    // 留白的演进（按 2340px 屏、侧栏 220px 计算，每侧留白）：
+    //   max-w-3xl (768px)  → 676px
+    //   max-w-[1180px]     → 470px
+    //   max-w-[1800px]     → 160px   ← 用户反馈"还是留白太多"
+    //   去除上限（本版）    → 0（仅 px-8 内边距）
+    // 结论：只要保留居中定宽，宽屏上就一定有留白；本页内容（账号卡片、
+    // 状态块、操作按钮）都是横向铺开的行式布局，能自然拉伸，故完全放开。
+    // 兼容网关页同步做了相同处理，两页留白表现保持一致。
+    <div className="w-full space-y-6 px-5 py-6 sm:px-8 sm:py-8">
       <header className="mb-6">
         <div className="flex items-start justify-between gap-4">
           <div className="min-w-0">
@@ -999,7 +1112,12 @@ export default function AccountsPage() {
             暂无账号。点击上方按钮导入本机账号或 OAuth 登录。
           </div>
         ) : (
-          <div className={cn("grid min-w-0 items-start gap-5", compact ? "grid-cols-[repeat(auto-fit,minmax(min(100%,300px),1fr))]" : "grid-cols-[repeat(auto-fit,minmax(min(100%,340px),1fr))]")}>
+          /* 卡片网格：auto-rows-fr 让同一排的卡片等高。
+             此前用 items-start，每张卡片按自身内容高度渲染，于是「只有 1 个积分包」
+             的账号会比同排「有 2 个积分包」的账号矮一截（实测 171px vs 208px）。
+             等高后资源包列表的差异只体现为卡片内留白，不再破坏整排对齐。
+             注意不要保留 items-start：它会让卡片不拉伸，auto-rows-fr 就失效了。 */
+          <div className={cn("grid auto-rows-fr min-w-0 gap-5", compact ? "grid-cols-[repeat(auto-fit,minmax(min(100%,300px),1fr))]" : "grid-cols-[repeat(auto-fit,minmax(min(100%,340px),1fr))]")}>
             {orderedAccounts.map((a) => (
               <AccountCard
                 key={a.id}
@@ -1009,10 +1127,31 @@ export default function AccountsPage() {
                 // 备注改完后重新拉列表：备注存在账号库里，卡片本身不持有列表状态，
                 // 不刷新的话关闭弹窗后卡片上仍是旧备注。
                 onNoteSaved={() => void fetchAll()}
+                // 禁用状态存在账号库里，且后端会重导出凭证并按需重启网关，
+                // 因此这里刷新账号列表让界面立刻反映新状态。
+                onToggleDisabled={async (target) => {
+                  const next = !target.disabled;
+                  const label = target.nickname || target.uid || "该账号";
+                  try {
+                    await api.setAccountDisabled(target.id, next);
+                    toast.success(
+                      next
+                        ? `已禁用「${label}」：不再进入账号池，签到等养号任务继续运行`
+                        : `已启用「${label}」：已重新加入账号池`,
+                    );
+                  } catch (e) {
+                    toast.error(api.asError(e));
+                  }
+                  // 无论成功失败都刷新：失败时界面回到后端真实状态
+                  await fetchAll();
+                }}
                 onSwitch={setSwitchAccount}
                 onCheckin={onCheckin}
                 onRefresh={onRefresh}
                 onAdopt={onAdopt}
+                onRunTask={onRunTask}
+                taskRunning={taskRunning}
+                runningTask={runningTaskByAccountId.get(a.id) ?? null}
                 todayCheckedIn={checkinMap[a.id]}
                 travelStatus={travelMap[a.id]}
                 credit={creditMap[a.id]}

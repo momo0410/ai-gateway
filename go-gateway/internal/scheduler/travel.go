@@ -119,19 +119,36 @@ func (s *Scheduler) travelAdopt(a *auth.Auth) {
 	if s.adoptTriedToday(a.UID) {
 		return
 	}
+	s.adoptBuddy(a, false)
+}
+
+// travelAdoptForce 豁免当日防抖的领养重试。
+//
+// 用在活跃上报之后：刚补满对话量，此前「门槛未达」的判断已经失效，
+// 应当立即重试一次，而不是等到明天。成功则顺带清掉当日标记。
+func (s *Scheduler) travelAdoptForce(a *auth.Auth) {
+	s.adoptBuddy(a, true)
+}
+
+// adoptBuddy 领养主流程；force=true 时忽略当日防抖标记。
+func (s *Scheduler) adoptBuddy(a *auth.Auth, force bool) {
+	if !force && s.adoptTriedToday(a.UID) {
+		return
+	}
 	if err := s.cfg.Upstream.BuddyAgreement(a); err != nil {
-		log.Printf("travel %s: agreement: %v", a.UID, err)
+		log.Printf("travel %s: agreement: %v", uid8(a.UID), err)
 		return
 	}
 	err := s.cfg.Upstream.BuddyFirst(a)
 	switch {
 	case err == nil:
-		log.Printf("travel %s: adopt ok (+300 credits)", a.UID)
+		s.clearAdoptTried(a.UID) // 成功即清标记，避免残留影响后续判断
+		log.Printf("travel %s: adopt ok (+300 credits)", uid8(a.UID))
 	case upstream.IsBuddyTaskIncomplete(err):
 		s.markAdoptTried(a.UID)
-		log.Printf("travel %s: adopt skipped (conversation threshold not reached, retry tomorrow)", a.UID)
+		log.Printf("travel %s: adopt skipped (conversation threshold not reached, retry tomorrow)", uid8(a.UID))
 	default:
-		log.Printf("travel %s: adopt: %v", a.UID, err)
+		log.Printf("travel %s: adopt: %v", uid8(a.UID), err)
 	}
 }
 
@@ -147,4 +164,11 @@ func (s *Scheduler) markAdoptTried(uid string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.adoptTried[uid] = travelDay(time.Now())
+}
+
+// clearAdoptTried 清除该账号的当日领养标记（领养成功或需重新评估时）。
+func (s *Scheduler) clearAdoptTried(uid string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.adoptTried, uid)
 }
